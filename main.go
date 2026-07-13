@@ -5,14 +5,22 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+// Win32 창/메뉴는 만든 스레드에서만 다룰 수 있으므로 main 고루틴을 OS 스레드에 고정한다.
+func init() {
+	runtime.LockOSThread()
+}
 
 var (
 	user32   = windows.NewLazySystemDLL("user32.dll")
@@ -150,6 +158,13 @@ type app struct {
 }
 
 func main() {
+	// windowsgui 빌드는 콘솔이 없어 패닉이 보이지 않으므로 메시지박스로 알린다.
+	defer func() {
+		if r := recover(); r != nil {
+			alert("gotool", fmt.Sprintf("오류가 발생했습니다:\n%v", r), mbIconError)
+		}
+	}()
+
 	procSetProcessDPIAware.Call()
 
 	dir, err := resolveDir()
@@ -189,7 +204,7 @@ func main() {
 	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
 	procSetForegroundWindow.Call(uintptr(hwnd))
 
-	cmd, _, _ := procTrackPopupMenuEx.Call(
+	cmd, _, callErr := procTrackPopupMenuEx.Call(
 		uintptr(menu),
 		tpmReturnCmd|tpmLeftButton,
 		uintptr(pt.x), uintptr(pt.y),
@@ -199,6 +214,12 @@ func main() {
 		if path, ok := a.cmds[uint32(cmd)]; ok {
 			launch(path)
 		}
+		return
+	}
+	// cmd==0 은 대부분 사용자가 메뉴를 취소한 경우지만,
+	// 실제 실패(GetLastError != 0)라면 원인을 표시한다.
+	if errno, ok := callErr.(syscall.Errno); ok && errno != 0 {
+		alert("gotool", fmt.Sprintf("메뉴를 표시하지 못했습니다.\n(오류 %d: %v)", uint32(errno), errno), mbIconError)
 	}
 }
 
