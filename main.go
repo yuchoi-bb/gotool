@@ -118,6 +118,16 @@ var (
 	procDestroyIcon         = user32.NewProc("DestroyIcon")
 	procGetDC               = user32.NewProc("GetDC")
 	procReleaseDC           = user32.NewProc("ReleaseDC")
+	procMonitorFromPoint    = user32.NewProc("MonitorFromPoint")
+	procGetMonitorInfoW     = user32.NewProc("GetMonitorInfoW")
+	procGetWindowRect       = user32.NewProc("GetWindowRect")
+	procMoveWindow          = user32.NewProc("MoveWindow")
+	procSendMessageW        = user32.NewProc("SendMessageW")
+	procGetWindowTextW      = user32.NewProc("GetWindowTextW")
+	procGetWindowTextLenW   = user32.NewProc("GetWindowTextLengthW")
+	procSetWindowTextW      = user32.NewProc("SetWindowTextW")
+	procAdjustWindowRectEx  = user32.NewProc("AdjustWindowRectEx")
+	procIsDialogMessageW    = user32.NewProc("IsDialogMessageW")
 
 	procCreateCompatibleDC     = gdi32.NewProc("CreateCompatibleDC")
 	procCreateCompatibleBitmap = gdi32.NewProc("CreateCompatibleBitmap")
@@ -153,8 +163,24 @@ const (
 
 	swShow = 5
 
+	swpNoSize   = 0x0001
 	swpNoMove   = 0x0002
 	swpNoZorder = 0x0004
+
+	wsChild   = 0x40000000
+	wsVisible = 0x10000000
+	wsCaption = 0x00C00000
+	wsSysMenu = 0x00080000
+	wsTabStop = 0x00010000
+
+	esAutoHScroll   = 0x0080
+	bsDefPushButton = 0x0001
+
+	wmClose   = 0x0010
+	wmSetFont = 0x0030
+	wmCommand = 0x0111
+
+	monitorDefaultToNearest = 2
 
 	wmDestroy     = 0x0002
 	wmActivate    = 0x0006
@@ -347,6 +373,44 @@ type shFileInfo struct {
 	szTypeName    [80]uint16
 }
 
+type monitorInfo struct {
+	cbSize    uint32
+	rcMonitor rect
+	rcWork    rect
+	dwFlags   uint32
+}
+
+// monitorWorkFromPoint 는 해당 좌표가 속한 모니터의 작업 영역을 돌려준다.
+// 창이 모니터 경계를 넘어 옆 모니터로 걸치지 않게 하는 데 쓴다.
+func monitorWorkFromPoint(pt point) rect {
+	packed := uintptr(uint32(pt.x)) | uintptr(uint32(pt.y))<<32
+	hm, _, _ := procMonitorFromPoint.Call(packed, monitorDefaultToNearest)
+	if hm != 0 {
+		mi := monitorInfo{cbSize: uint32(unsafe.Sizeof(monitorInfo{}))}
+		if r, _, _ := procGetMonitorInfoW.Call(hm, uintptr(unsafe.Pointer(&mi))); r != 0 {
+			return mi.rcWork
+		}
+	}
+	return rect{0, 0, getSystemMetrics(smCxVirtualScreen, 1920), getSystemMetrics(smCyVirtualScreen, 1080)}
+}
+
+// clampIntoWork 는 (x,y,w,h) 창이 작업 영역 안에 들어오도록 좌표를 보정한다.
+func clampIntoWork(wa rect, x, y, w, h int32) (int32, int32) {
+	if x+w > wa.right {
+		x = wa.right - w
+	}
+	if y+h > wa.bottom {
+		y = wa.bottom - h
+	}
+	if x < wa.left {
+		x = wa.left
+	}
+	if y < wa.top {
+		y = wa.top
+	}
+	return x, y
+}
+
 type openFileNameW struct {
 	lStructSize       uint32
 	_                 uint32
@@ -438,10 +502,14 @@ type app struct {
 	dropCat  int
 	dropIdx  int
 
-	modal bool // 대화상자 표시 중(비활성화로 창이 닫히지 않게)
+	modal bool // 대화상자/설정 창 표시 중(비활성화로 창이 닫히지 않게)
 
 	update   *updateInfo
 	updateCh chan *updateInfo
+
+	settings   *settingsUI // 열려 있는 설정 창(없으면 nil)
+	setClsReg  bool
+	panelAlive bool
 }
 
 func main() {
@@ -543,27 +611,11 @@ func runPanel(dir string) {
 
 	a.reload()
 
-	// 커서 위치에 표시(화면 밖으로 나가지 않게 보정)
+	// 커서 위치에 표시. 커서가 있는 모니터의 작업 영역 안에서만 열리게 보정
+	// (모니터 가장자리라도 옆 모니터로 넘어가지 않음)
 	var pt point
 	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
-	vx := getSystemMetrics(smXVirtualScreen, 0)
-	vy := getSystemMetrics(smYVirtualScreen, 0)
-	vw := getSystemMetrics(smCxVirtualScreen, 1920)
-	vh := getSystemMetrics(smCyVirtualScreen, 1080)
-	x := pt.x
-	y := pt.y
-	if x+a.winW > vx+vw {
-		x = vx + vw - a.winW
-	}
-	if y+a.winH > vy+vh {
-		y = vy + vh - a.winH
-	}
-	if x < vx {
-		x = vx
-	}
-	if y < vy {
-		y = vy
-	}
+	x, y := clampIntoWork(monitorWorkFromPoint(pt), pt.x, pt.y, a.winW, a.winH)
 	procSetWindowPos.Call(uintptr(a.hwnd), 0, uintptr(x), uintptr(y), uintptr(a.winW), uintptr(a.winH), swpNoZorder)
 	procShowWindow.Call(uintptr(a.hwnd), swShow)
 	procSetForegroundWindow.Call(uintptr(a.hwnd))
@@ -574,11 +626,19 @@ func runPanel(dir string) {
 		procPostMessageW.Call(uintptr(a.hwnd), wmAppUpdate, 0, 0)
 	}()
 
+	a.panelAlive = true
+
 	var m msgStruct
 	for {
 		r, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
 		if r == 0 || int32(r) == -1 {
 			break
+		}
+		// 설정 창이 열려 있으면 TAB/Enter/ESC 등 대화상자 키 처리
+		if a.settings != nil && a.settings.hwnd != 0 {
+			if d, _, _ := procIsDialogMessageW.Call(uintptr(a.settings.hwnd), uintptr(unsafe.Pointer(&m))); d != 0 {
+				continue
+			}
 		}
 		procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
 		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))
@@ -666,7 +726,10 @@ func (a *app) wndProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 		}
 		return 0
 	case wmDestroy:
-		procPostQuitMessage.Call(0)
+		a.panelAlive = false
+		if a.settings == nil {
+			procPostQuitMessage.Call(0)
+		}
 		return 0
 	}
 	r, _, _ := procDefWindowProcW.Call(hwnd, msg, wparam, lparam)
@@ -1040,7 +1103,7 @@ func (a *app) onLButtonUp(x, y int32) {
 		}
 		procDestroyWindow.Call(uintptr(a.hwnd))
 	case hitSettings:
-		launchWith("notepad.exe", configPath(a.dataDir))
+		a.openSettings()
 	case hitOpen:
 		launch(a.dataDir)
 		procDestroyWindow.Call(uintptr(a.hwnd))
@@ -1155,6 +1218,328 @@ func (a *app) modalAlertErr(code, msg string, err error) {
 	alertErr(code, msg, err)
 	a.modal = false
 	procSetForegroundWindow.Call(uintptr(a.hwnd))
+}
+
+// ---- 설정 창 (열 이름·구성 편집 UI) ----
+
+// 대화상자 키 처리(IsDialogMessage)와 맞추기 위해 저장=IDOK(1), 취소=IDCANCEL(2)을 쓴다.
+const (
+	idSetSave   = 1 // Enter 키로도 저장
+	idSetCancel = 2 // ESC 키로도 닫기
+	idSetAdd    = 3
+	idSetRow    = 100 // 행 컨트롤 공용 ID(실제 구분은 핸들로)
+)
+
+var autoCycle = []string{"", "web", "dev", "etc"}
+
+func autoLabel(auto string) string {
+	switch auto {
+	case "web":
+		return "자동: 웹주소"
+	case "dev":
+		return "자동: 개발"
+	case "etc":
+		return "자동: 기타"
+	}
+	return "자동: 없음"
+}
+
+type setRow struct {
+	nameEd   windows.Handle
+	folderEd windows.Handle
+	autoBtn  windows.Handle
+	delBtn   windows.Handle
+	auto     string
+}
+
+type settingsUI struct {
+	a       *app
+	hwnd    windows.Handle
+	rows    []*setRow
+	addBtn  windows.Handle
+	saveBtn windows.Handle
+	cancel  windows.Handle
+	devKeys []string
+}
+
+const settingsStyle = wsPopup | wsCaption | wsSysMenu
+
+func (a *app) openSettings() {
+	if a.settings != nil {
+		procSetForegroundWindow.Call(uintptr(a.settings.hwnd))
+		return
+	}
+	a.modal = true // 설정 창이 떠 있는 동안 패널이 닫히지 않게
+	s := &settingsUI{a: a}
+	a.settings = s
+	if !s.create() {
+		a.settings = nil
+		a.modal = false
+		a.modalAlertErr(errWindow, "설정 창을 만들지 못했습니다", nil)
+	}
+}
+
+func (s *settingsUI) create() bool {
+	a := s.a
+	hInst, _, _ := procGetModuleHandleW.Call(0)
+	className := utf16Ptr("gotoolSettingsWnd")
+
+	if !a.setClsReg {
+		arrow, _, _ := procLoadCursorW.Call(0, idcArrow)
+		wndProc := windows.NewCallback(a.settingsProc)
+		wc := wndClassEx{
+			cbSize:        uint32(unsafe.Sizeof(wndClassEx{})),
+			lpfnWndProc:   wndProc,
+			hInstance:     windows.Handle(hInst),
+			hCursor:       windows.Handle(arrow),
+			hbrBackground: windows.Handle(colorMenu + 1),
+			lpszClassName: className,
+		}
+		procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
+		a.setClsReg = true
+	}
+
+	hwnd, _, _ := procCreateWindowExW.Call(
+		wsExTopmost|wsExToolWindow,
+		uintptr(unsafe.Pointer(className)),
+		uintptr(unsafe.Pointer(utf16Ptr("gotool 설정 — 열 구성"))),
+		settingsStyle,
+		0, 0, 10, 10,
+		0, 0, hInst, 0,
+	)
+	if hwnd == 0 {
+		return false
+	}
+	s.hwnd = windows.Handle(hwnd)
+
+	cfg := loadConfig(a.dataDir)
+	s.devKeys = cfg.DevKeywords
+
+	// 머리글
+	s.static("열 이름")
+	s.static("폴더 이름")
+	s.static("자동 분류")
+	for _, c := range cfg.Columns {
+		s.addRowControls(c)
+	}
+	s.addBtn = s.child("BUTTON", "＋ 열 추가", wsChild|wsVisible|wsTabStop, idSetAdd)
+	s.saveBtn = s.child("BUTTON", "저장", wsChild|wsVisible|wsTabStop|bsDefPushButton, idSetSave)
+	s.cancel = s.child("BUTTON", "취소", wsChild|wsVisible|wsTabStop, idSetCancel)
+
+	s.relayout()
+
+	// 패널 근처, 같은 모니터 안에 표시
+	var pr rect
+	procGetWindowRect.Call(uintptr(a.hwnd), uintptr(unsafe.Pointer(&pr)))
+	var wr rect
+	procGetWindowRect.Call(uintptr(s.hwnd), uintptr(unsafe.Pointer(&wr)))
+	w, h := wr.right-wr.left, wr.bottom-wr.top
+	x, y := clampIntoWork(monitorWorkFromPoint(point{pr.left, pr.top}), pr.left+a.scale(24), pr.top+a.scale(24), w, h)
+	procSetWindowPos.Call(uintptr(s.hwnd), 0, uintptr(x), uintptr(y), 0, 0, swpNoSize|swpNoZorder)
+
+	procShowWindow.Call(uintptr(s.hwnd), swShow)
+	procSetForegroundWindow.Call(uintptr(s.hwnd))
+	return true
+}
+
+// static 은 머리글 라벨을 만든다(위치는 relayout에서).
+func (s *settingsUI) static(text string) windows.Handle {
+	return s.child("STATIC", text, wsChild|wsVisible, idSetRow)
+}
+
+var settingsLabels []windows.Handle // 머리글 3개(단일 설정 창 전제)
+
+func (s *settingsUI) child(class, text string, style uintptr, id int) windows.Handle {
+	hInst, _, _ := procGetModuleHandleW.Call(0)
+	h, _, _ := procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(utf16Ptr(class))),
+		uintptr(unsafe.Pointer(utf16Ptr(text))),
+		style,
+		0, 0, 10, 10,
+		uintptr(s.hwnd), uintptr(id), hInst, 0,
+	)
+	procSendMessageW.Call(h, wmSetFont, uintptr(s.a.font), 1)
+	if class == "STATIC" {
+		settingsLabels = append(settingsLabels, windows.Handle(h))
+	}
+	return windows.Handle(h)
+}
+
+func (s *settingsUI) addRowControls(c column) {
+	r := &setRow{auto: c.Auto}
+	r.nameEd = s.child("EDIT", c.Name, wsChild|wsVisible|wsBorder|wsTabStop|esAutoHScroll, idSetRow)
+	r.folderEd = s.child("EDIT", c.Folder, wsChild|wsVisible|wsBorder|wsTabStop|esAutoHScroll, idSetRow)
+	r.autoBtn = s.child("BUTTON", autoLabel(c.Auto), wsChild|wsVisible|wsTabStop, idSetRow)
+	r.delBtn = s.child("BUTTON", "✕", wsChild|wsVisible|wsTabStop, idSetRow)
+	s.rows = append(s.rows, r)
+}
+
+// relayout 은 컨트롤 배치와 창 크기를 다시 계산한다.
+func (s *settingsUI) relayout() {
+	a := s.a
+	m := a.scale(12)
+	rh := a.scale(32)
+	eh := a.scale(24)
+	gap := a.scale(8)
+	wName, wFolder, wAuto, wDel := a.scale(190), a.scale(130), a.scale(120), a.scale(30)
+
+	move := func(h windows.Handle, x, y, w, hh int32) {
+		procMoveWindow.Call(uintptr(h), uintptr(x), uintptr(y), uintptr(w), uintptr(hh), 1)
+	}
+
+	x0 := m
+	x1 := x0 + wName + gap
+	x2 := x1 + wFolder + gap
+	x3 := x2 + wAuto + gap
+	clientW := x3 + wDel + m
+
+	// 머리글
+	if len(settingsLabels) >= 3 {
+		move(settingsLabels[0], x0, m, wName, eh)
+		move(settingsLabels[1], x1, m, wFolder, eh)
+		move(settingsLabels[2], x2, m, wAuto, eh)
+	}
+
+	y := m + a.scale(24)
+	for _, r := range s.rows {
+		move(r.nameEd, x0, y, wName, eh)
+		move(r.folderEd, x1, y, wFolder, eh)
+		move(r.autoBtn, x2, y, wAuto, eh)
+		move(r.delBtn, x3, y, wDel, eh)
+		y += rh
+	}
+	y += a.scale(8)
+
+	bh := a.scale(28)
+	bw := a.scale(96)
+	move(s.addBtn, m, y, a.scale(110), bh)
+	move(s.saveBtn, clientW-m-bw*2-gap, y, bw, bh)
+	move(s.cancel, clientW-m-bw, y, bw, bh)
+	y += bh + m
+
+	rc := rect{0, 0, clientW, y}
+	procAdjustWindowRectEx.Call(uintptr(unsafe.Pointer(&rc)), settingsStyle, 0, wsExTopmost|wsExToolWindow)
+	procSetWindowPos.Call(uintptr(s.hwnd), 0, 0, 0, uintptr(rc.right-rc.left), uintptr(rc.bottom-rc.top), swpNoMove|swpNoZorder)
+	procInvalidateRect.Call(uintptr(s.hwnd), 0, 1)
+}
+
+func (a *app) settingsProc(hwnd, msg, wparam, lparam uintptr) uintptr {
+	s := a.settings
+	switch msg {
+	case wmCommand:
+		if s == nil {
+			break
+		}
+		switch int(wparam & 0xFFFF) {
+		case idSetSave:
+			if s.save() {
+				procDestroyWindow.Call(hwnd)
+			}
+			return 0
+		case idSetCancel:
+			procDestroyWindow.Call(hwnd)
+			return 0
+		case idSetAdd:
+			s.addRowControls(column{Name: "", Folder: ""})
+			s.relayout()
+			return 0
+		}
+		ctrl := windows.Handle(lparam)
+		for i, r := range s.rows {
+			if ctrl == r.autoBtn {
+				next := 0
+				for j, k := range autoCycle {
+					if k == r.auto {
+						next = (j + 1) % len(autoCycle)
+					}
+				}
+				r.auto = autoCycle[next]
+				procSetWindowTextW.Call(uintptr(r.autoBtn), uintptr(unsafe.Pointer(utf16Ptr(autoLabel(r.auto)))))
+				return 0
+			}
+			if ctrl == r.delBtn {
+				if len(s.rows) <= 1 {
+					s.warn("열은 최소 1개가 필요합니다.")
+					return 0
+				}
+				for _, h := range []windows.Handle{r.nameEd, r.folderEd, r.autoBtn, r.delBtn} {
+					procDestroyWindow.Call(uintptr(h))
+				}
+				s.rows = append(s.rows[:i], s.rows[i+1:]...)
+				s.relayout()
+				return 0
+			}
+		}
+		return 0
+	case wmClose:
+		procDestroyWindow.Call(hwnd)
+		return 0
+	case wmDestroy:
+		a.settings = nil
+		settingsLabels = nil
+		a.modal = false
+		if a.panelAlive {
+			a.refresh()
+			procSetForegroundWindow.Call(uintptr(a.hwnd))
+		} else {
+			procPostQuitMessage.Call(0)
+		}
+		return 0
+	}
+	r, _, _ := procDefWindowProcW.Call(hwnd, msg, wparam, lparam)
+	return r
+}
+
+func (s *settingsUI) warn(msg string) {
+	procMessageBoxW.Call(uintptr(s.hwnd),
+		uintptr(unsafe.Pointer(utf16Ptr(msg))),
+		uintptr(unsafe.Pointer(utf16Ptr("gotool 설정"))),
+		mbOK|mbIconWarning)
+}
+
+// save 는 입력을 검증해 config.json 에 저장한다. 실패하면 창을 닫지 않는다.
+func (s *settingsUI) save() bool {
+	var cols []column
+	used := map[string]bool{}
+	for _, r := range s.rows {
+		name := strings.TrimSpace(getWindowText(r.nameEd))
+		folder := strings.TrimSpace(getWindowText(r.folderEd))
+		if folder == "" {
+			s.warn("폴더 이름을 입력해 주세요. (shortcuts 안에 만들어질 하위 폴더 이름)")
+			return false
+		}
+		if strings.ContainsAny(folder, `\/:*?"<>|`) {
+			s.warn("폴더 이름에 사용할 수 없는 문자가 있습니다:\n" + folder)
+			return false
+		}
+		lf := strings.ToLower(folder)
+		if used[lf] {
+			s.warn("폴더 이름이 중복되었습니다:\n" + folder)
+			return false
+		}
+		used[lf] = true
+		if name == "" {
+			name = folder
+		}
+		cols = append(cols, column{Name: name, Folder: folder, Auto: r.auto})
+	}
+	if len(cols) == 0 {
+		s.warn("열은 최소 1개가 필요합니다.")
+		return false
+	}
+	saveConfig(s.a.dataDir, appConfig{Columns: cols, DevKeywords: s.devKeys})
+	return true
+}
+
+func getWindowText(h windows.Handle) string {
+	n, _, _ := procGetWindowTextLenW.Call(uintptr(h))
+	if n == 0 {
+		return ""
+	}
+	buf := make([]uint16, n+1)
+	procGetWindowTextW.Call(uintptr(h), uintptr(unsafe.Pointer(&buf[0])), n+1)
+	return windows.UTF16ToString(buf)
 }
 
 // ---- 백업/복원 ----

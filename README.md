@@ -28,26 +28,16 @@
 
 ## 설정 (열 이름 수정 · 열 추가)
 
-패널 하단 **"⚙ 설정"** 버튼을 누르면 `shortcuts\config.json`이 메모장으로 열립니다.
+패널 하단 **"⚙ 설정"** 버튼을 누르면 **설정 창**이 열립니다.
 
-```json
-{
-  "columns": [
-    { "name": "🌐 웹",    "folder": "웹",    "auto": "web" },
-    { "name": "💻 개발",  "folder": "개발",  "auto": "dev" },
-    { "name": "📦 비개발", "folder": "비개발", "auto": "etc" },
-    { "name": "🐿 다람쥐", "folder": "다람쥐" }
-  ]
-}
-```
+- **열 이름**: 패널에 표시되는 제목을 입력창에서 바로 수정
+- **폴더 이름**: 그 열의 항목이 저장되는 `shortcuts` 하위 폴더 이름
+- **자동 분류**: 버튼을 눌러 `웹주소 / 개발 / 기타 / 없음` 순환 선택 (없음 = 수동 전용 열)
+- **＋ 열 추가** / 행 끝의 **✕** 로 열 추가·삭제 (최소 1개)
+- **저장**(Enter) 하면 즉시 패널에 반영, **취소**(ESC)로 닫기
 
-- `name`: 패널에 표시되는 열 제목 — 자유롭게 수정
-- `folder`: `shortcuts` 안의 하위 폴더 이름(그 열의 항목이 저장되는 곳)
-- `auto`: 자동 분류 대상(`web`/`dev`/`etc`), 생략하면 수동 전용 열
-- **열 추가**: `{ "name": "🎮 게임", "folder": "게임" }` 처럼 항목을 배열에 추가
-- `devKeywords` 배열을 추가하면 개발 키워드 목록을 직접 지정할 수 있습니다
-
-저장 후 gotool을 다시 실행하면 적용됩니다.
+설정은 `shortcuts\config.json`에 저장되므로 백업에 포함되며, 파일을 직접 편집해도 됩니다.
+(`devKeywords` 배열을 추가하면 "개발" 자동 분류 키워드를 직접 지정할 수 있습니다)
 
 ## 백업 · 복원 (포맷 대비)
 
@@ -117,7 +107,7 @@ return
 [Releases](../../releases/latest) 페이지에서 `gotool.exe`를 내려받으세요.
 
 ```
-go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=v0.5.0" -o gotool.exe .
+go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=v0.6.0" -o gotool.exe .
 ```
 
 `main`에 푸시하거나 `v*` 태그를 만들면 GitHub Actions가 자동으로 빌드해 릴리스에 `gotool.exe`를 올립니다.
