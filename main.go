@@ -69,6 +69,7 @@ const (
 	errUpdate   = "E07" // 업데이트 확인 실패(알림 없이 기록만)
 	errBackup   = "E08" // 백업/복원 실패
 	errConfig   = "E09" // 설정 파일(config.json) 오류
+	errSelfUp   = "E10" // 자동 업데이트(자기 교체) 실패
 	errPanic    = "E99" // 예기치 못한 오류(패닉)
 )
 
@@ -193,6 +194,7 @@ const (
 	wmLButtonUp   = 0x0202
 	wmRButtonUp   = 0x0205
 	wmAppUpdate   = 0x8000 + 1 // 업데이트 확인 완료(고루틴 → UI 스레드)
+	wmAppUpdated  = 0x8000 + 2 // 자동 업데이트(다운로드/교체) 완료
 
 	waInactive = 0
 	vkEscape   = 0x1B
@@ -506,6 +508,8 @@ type app struct {
 
 	update   *updateInfo
 	updateCh chan *updateInfo
+	updating bool // 자동 업데이트 다운로드 진행 중
+	updErrCh chan error
 
 	settings   *settingsUI // 열려 있는 설정 창(없으면 nil)
 	setClsReg  bool
@@ -523,6 +527,11 @@ func main() {
 	procSetProcessDPIAware.Call()
 	procCoInitializeEx.Call(0, coinitApartment)
 	defer procCoUninitialize.Call()
+
+	// 지난 자동 업데이트가 남긴 이전 버전 파일 정리(실패해도 무시)
+	if exe, err := os.Executable(); err == nil {
+		os.Remove(filepath.Join(filepath.Dir(exe), "gotool-old.exe"))
+	}
 
 	args := os.Args[1:]
 	if len(args) > 0 {
@@ -588,6 +597,7 @@ func runPanel(dir string) {
 		iconCx:   getSystemMetrics(smCxSmIcon, 16),
 		iconCy:   getSystemMetrics(smCySmIcon, 16),
 		updateCh: make(chan *updateInfo, 1),
+		updErrCh: make(chan error, 1),
 		hover:    hit{kind: hitNone},
 		pressed:  hit{kind: hitNone},
 		dropCat:  -1,
@@ -706,12 +716,12 @@ func (a *app) wndProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 			return 1
 		}
 	case wmKeyDown:
-		if wparam == vkEscape {
+		if wparam == vkEscape && !a.updating {
 			procDestroyWindow.Call(hwnd)
 			return 0
 		}
 	case wmActivate:
-		if wparam&0xFFFF == waInactive && !a.modal && !a.dragging {
+		if wparam&0xFFFF == waInactive && !a.modal && !a.dragging && !a.updating {
 			procDestroyWindow.Call(hwnd)
 			return 0
 		}
@@ -724,6 +734,30 @@ func (a *app) wndProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 			}
 		default:
 		}
+		return 0
+	case wmAppUpdated:
+		var err error
+		select {
+		case err = <-a.updErrCh:
+		default:
+		}
+		a.updating = false
+		if err != nil {
+			// 자동 교체 실패(권한 등) 시 기존 방식(브라우저 다운로드)으로 대체
+			a.modalAlertErr(errSelfUp, "자동 업데이트에 실패해 브라우저로 내려받습니다.\n다운로드한 파일로 gotool.exe를 직접 바꿔 주세요", err)
+			if a.update != nil {
+				launch(a.update.url)
+			}
+			procInvalidateRect.Call(uintptr(a.hwnd), 0, 1)
+			return 0
+		}
+		a.modal = true
+		alert("gotool", "업데이트가 완료되었습니다!\n새 버전을 실행합니다.", mbIconInformation)
+		a.modal = false
+		if exe, e := os.Executable(); e == nil {
+			launch(exe)
+		}
+		procDestroyWindow.Call(uintptr(a.hwnd))
 		return 0
 	case wmDestroy:
 		a.panelAlive = false
@@ -942,7 +976,11 @@ func (a *app) paint(hdc uintptr) {
 
 	// 업데이트 버튼
 	if a.update != nil {
-		rowText(a.updRc, "⬆ 새 버전 "+a.update.tag+" 다운로드", 0, a.hover.kind == hitUpdate, false)
+		label := "⬆ 새 버전 " + a.update.tag + " 업데이트 (클릭 한 번으로 자동 교체)"
+		if a.updating {
+			label = "⬇ " + a.update.tag + " 다운로드 중... 잠시만 기다려 주세요"
+		}
+		rowText(a.updRc, label, 0, a.hover.kind == hitUpdate && !a.updating, a.updating)
 		line := rect{a.updRc.left, a.updRc.bottom + a.scale(2), a.updRc.right, a.updRc.bottom + a.scale(3)}
 		procFillRect.Call(memDC, uintptr(unsafe.Pointer(&line)), brush(color3DShadow))
 	}
@@ -1098,10 +1136,22 @@ func (a *app) onLButtonUp(x, y int32) {
 		launch(a.items[prev.cat][prev.idx].path)
 		procDestroyWindow.Call(uintptr(a.hwnd))
 	case hitUpdate:
-		if a.update != nil {
-			launch(a.update.url)
+		// 브라우저로 보내지 않고 직접 내려받아 자기 자신을 교체한다.
+		if a.update == nil || a.updating {
+			return
 		}
-		procDestroyWindow.Call(uintptr(a.hwnd))
+		a.updating = true
+		procInvalidateRect.Call(uintptr(a.hwnd), 0, 0)
+		url := a.update.url
+		hwnd := a.hwnd
+		go func() {
+			err := selfUpdate(url)
+			select {
+			case a.updErrCh <- err:
+			default:
+			}
+			procPostMessageW.Call(uintptr(hwnd), wmAppUpdated, 0, 0)
+		}()
 	case hitSettings:
 		a.openSettings()
 	case hitOpen:
@@ -2035,6 +2085,50 @@ func checkUpdate(ch chan<- *updateInfo) {
 		}
 	}
 	send(&updateInfo{tag: rel.TagName, url: url})
+}
+
+// selfUpdate 는 새 exe를 내려받아 실행 중인 자신을 교체한다.
+// 실행 중인 exe는 덮어쓸 수 없지만 이름 변경은 가능하다는 점을 이용한다:
+// 현재 exe → gotool-old.exe 로 밀어내고, 받은 파일을 제자리에 넣는다.
+func selfUpdate(url string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(exe)
+	tmp := filepath.Join(dir, "gotool-new.exe")
+	oldp := filepath.Join(dir, "gotool-old.exe")
+
+	client := &http.Client{Timeout: 3 * time.Minute}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("다운로드 실패: HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if len(data) < 100*1024 || data[0] != 'M' || data[1] != 'Z' {
+		return fmt.Errorf("받은 파일이 올바른 실행 파일이 아닙니다 (%d바이트)", len(data))
+	}
+	if err := os.WriteFile(tmp, data, 0o755); err != nil {
+		return err
+	}
+
+	os.Remove(oldp) // 이전 잔여물 제거(실패 무시)
+	if err := os.Rename(exe, oldp); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("실행 파일을 교체할 수 없습니다(폴더 권한 확인): %w", err)
+	}
+	if err := os.Rename(tmp, exe); err != nil {
+		os.Rename(oldp, exe) // 롤백
+		return err
+	}
+	return nil
 }
 
 // newerVersion 은 a("v1.2.3")가 b보다 새 버전이면 true.
