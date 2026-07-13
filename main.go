@@ -1,12 +1,15 @@
 //go:build windows
 
 // gotool — 즐겨찾기(바로가기) 런처.
-// 실행하면 마우스 커서 위치에 우클릭 메뉴 모양의 4열 팝업(웹 | 개발 | 비개발 | 다람쥐)이 뜨고,
-// 왼쪽 클릭은 실행, 오른쪽 클릭은 이동/삭제 메뉴를 연다.
+// 실행하면 마우스 커서 위치에 우클릭 메뉴 모양의 4열 패널(웹 | 개발 | 비개발 | 다람쥐)이 뜬다.
+//   - 왼쪽 클릭: 실행(창 닫힘)
+//   - 드래그 & 드롭: 항목을 다른 열로 이동(창은 닫히지 않고 제자리 유지)
+//   - 오른쪽 클릭: 삭제(확인창)
+//   - ESC 또는 바깥 클릭: 닫기
 //
 // 사용법:
 //
-//	gotool.exe              exe 옆 shortcuts 폴더의 내용을 4열 메뉴로 표시
+//	gotool.exe              exe 옆 shortcuts 폴더의 내용을 4열 패널로 표시
 //	gotool.exe <폴더>       지정한 폴더의 내용을 표시
 //	gotool.exe add <경로>   파일/폴더를 shortcuts 폴더에 추가 (.lnk/.url은 복사, 그 외는 바로가기 생성)
 //	gotool.exe install      탐색기 우클릭 메뉴에 "gotool에 추가" 등록
@@ -32,17 +35,17 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
-// 릴리스 빌드 시 ldflags 로 주입된다: -X main.version=v0.3.0
+// 릴리스 빌드 시 ldflags 로 주입된다: -X main.version=v0.4.0
 var version = "v0.0.0"
 
 const (
 	repoOwner = "yuchoi-bb"
 	repoName  = "gotool"
 
-	newBadgeAge = 72 * time.Hour // 추가된 지 이 기간 안이면 이름 앞에 "!" 표시
+	newBadgeAge = 10 * time.Minute // 추가된 지 이 시간 안이면 이름 오른쪽에 "!" 표시
 )
 
-// Win32 창/메뉴는 만든 스레드에서만 다룰 수 있으므로 main 고루틴을 OS 스레드에 고정한다.
+// Win32 창은 만든 스레드에서만 다룰 수 있으므로 main 고루틴을 OS 스레드에 고정한다.
 func init() {
 	runtime.LockOSThread()
 }
@@ -58,12 +61,26 @@ var (
 	procCreateWindowExW     = user32.NewProc("CreateWindowExW")
 	procDefWindowProcW      = user32.NewProc("DefWindowProcW")
 	procDestroyWindow       = user32.NewProc("DestroyWindow")
-	procCreatePopupMenu     = user32.NewProc("CreatePopupMenu")
-	procDestroyMenu         = user32.NewProc("DestroyMenu")
-	procInsertMenuItemW     = user32.NewProc("InsertMenuItemW")
-	procGetMenuItemID       = user32.NewProc("GetMenuItemID")
-	procEndMenu             = user32.NewProc("EndMenu")
-	procTrackPopupMenuEx    = user32.NewProc("TrackPopupMenuEx")
+	procShowWindow          = user32.NewProc("ShowWindow")
+	procSetWindowPos        = user32.NewProc("SetWindowPos")
+	procGetClientRect       = user32.NewProc("GetClientRect")
+	procInvalidateRect      = user32.NewProc("InvalidateRect")
+	procBeginPaint          = user32.NewProc("BeginPaint")
+	procEndPaint            = user32.NewProc("EndPaint")
+	procFillRect            = user32.NewProc("FillRect")
+	procFrameRect           = user32.NewProc("FrameRect")
+	procDrawTextW           = user32.NewProc("DrawTextW")
+	procGetSysColor         = user32.NewProc("GetSysColor")
+	procGetSysColorBrush    = user32.NewProc("GetSysColorBrush")
+	procSetCapture          = user32.NewProc("SetCapture")
+	procReleaseCapture      = user32.NewProc("ReleaseCapture")
+	procSetCursor           = user32.NewProc("SetCursor")
+	procLoadCursorW         = user32.NewProc("LoadCursorW")
+	procGetMessageW         = user32.NewProc("GetMessageW")
+	procTranslateMessage    = user32.NewProc("TranslateMessage")
+	procDispatchMessageW    = user32.NewProc("DispatchMessageW")
+	procPostQuitMessage     = user32.NewProc("PostQuitMessage")
+	procPostMessageW        = user32.NewProc("PostMessageW")
 	procGetCursorPos        = user32.NewProc("GetCursorPos")
 	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
 	procMessageBoxW         = user32.NewProc("MessageBoxW")
@@ -74,11 +91,17 @@ var (
 	procGetDC               = user32.NewProc("GetDC")
 	procReleaseDC           = user32.NewProc("ReleaseDC")
 
-	procCreateCompatibleDC = gdi32.NewProc("CreateCompatibleDC")
-	procDeleteDC           = gdi32.NewProc("DeleteDC")
-	procCreateDIBSection   = gdi32.NewProc("CreateDIBSection")
-	procSelectObject       = gdi32.NewProc("SelectObject")
-	procDeleteObject       = gdi32.NewProc("DeleteObject")
+	procCreateCompatibleDC     = gdi32.NewProc("CreateCompatibleDC")
+	procCreateCompatibleBitmap = gdi32.NewProc("CreateCompatibleBitmap")
+	procDeleteDC               = gdi32.NewProc("DeleteDC")
+	procSelectObject           = gdi32.NewProc("SelectObject")
+	procDeleteObject           = gdi32.NewProc("DeleteObject")
+	procBitBlt                 = gdi32.NewProc("BitBlt")
+	procSetBkMode              = gdi32.NewProc("SetBkMode")
+	procSetTextColor           = gdi32.NewProc("SetTextColor")
+	procCreateFontW            = gdi32.NewProc("CreateFontW")
+	procGetTextExtentPoint32W  = gdi32.NewProc("GetTextExtentPoint32W")
+	procGetDeviceCaps          = gdi32.NewProc("GetDeviceCaps")
 
 	procSHGetFileInfoW = shell32.NewProc("SHGetFileInfoW")
 	procShellExecuteW  = shell32.NewProc("ShellExecuteW")
@@ -91,36 +114,66 @@ var (
 )
 
 const (
-	wsPopup = 0x80000000
+	wsPopup  = 0x80000000
+	wsBorder = 0x00800000
 
-	miimState       = 0x0001
-	miimID          = 0x0002
-	miimString      = 0x0040
-	miimBitmap      = 0x0080
-	miimFType       = 0x0100
-	mftMenuBarBreak = 0x0020
-	mftSeparator    = 0x0800
-	mfsGrayed       = 0x0003
+	wsExTopmost    = 0x00000008
+	wsExToolWindow = 0x00000080
 
-	tpmReturnCmd = 0x0100
+	swShow = 5
 
-	wmMenuRButtonUp = 0x0122
+	swpNoMove   = 0x0002
+	swpNoZorder = 0x0004
+
+	wmDestroy     = 0x0002
+	wmActivate    = 0x0006
+	wmSetCursor   = 0x0020
+	wmEraseBkgnd  = 0x0014
+	wmPaint       = 0x000F
+	wmKeyDown     = 0x0100
+	wmMouseMove   = 0x0200
+	wmLButtonDown = 0x0201
+	wmLButtonUp   = 0x0202
+	wmRButtonUp   = 0x0205
+	wmAppUpdate   = 0x8000 + 1 // 업데이트 확인 완료(고루틴 → UI 스레드)
+
+	waInactive = 0
+	vkEscape   = 0x1B
+
+	idcArrow   = 32512
+	idcSizeAll = 32646
+
+	dtFlags = 0x0020 | 0x0004 | 0x8000 | 0x0800 // DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX
+
+	colorMenu          = 4
+	colorMenuText      = 7
+	colorHighlight     = 13
+	colorHighlightText = 14
+	color3DShadow      = 16
+	colorGrayText      = 17
+	colorHotlight      = 26
+
+	srcCopy       = 0x00CC0020
+	bkTransparent = 1
+	logPixelsY    = 90
 
 	shgfiIcon      = 0x00000100
 	shgfiSmallIcon = 0x00000001
 
-	smCxSmIcon = 49
-	smCySmIcon = 50
+	smCxSmIcon        = 49
+	smCySmIcon        = 50
+	smXVirtualScreen  = 76
+	smYVirtualScreen  = 77
+	smCxVirtualScreen = 78
+	smCyVirtualScreen = 79
 
-	diNormal     = 0x0003
-	dibRGBColors = 0
+	diNormal = 0x0003
 
 	swShowNormal = 1
 
 	mbOK              = 0x00000000
 	mbYesNo           = 0x00000004
 	mbIconError       = 0x00000010
-	mbIconQuestion    = 0x00000020
 	mbIconWarning     = 0x00000030
 	mbIconInformation = 0x00000040
 	idYes             = 6
@@ -129,7 +182,7 @@ const (
 	coinitApartment    = 2
 )
 
-// 카테고리(=메뉴 열)
+// 카테고리(=열)
 const (
 	catWeb = iota
 	catDev
@@ -141,7 +194,6 @@ const (
 var catNames = [catCount]string{"🌐 웹", "💻 개발", "📦 비개발", "🐿 다람쥐"}
 
 // shortcuts 폴더 안에서 카테고리를 강제하는 하위 폴더 이름.
-// 이 폴더 안에 넣은(탐색기에서 드래그한) 항목은 자동 분류 대신 해당 열에 표시된다.
 var catFolderNames = [catCount]string{"웹", "개발", "비개발", "다람쥐"}
 
 // 자동 분류에서 "개발"로 판정할 키워드(바로가기 이름/대상 경로에 포함되면 개발)
@@ -153,17 +205,13 @@ var devKeywords = []string{
 	"dbeaver", "cursor", "wsl", "개발",
 }
 
-// 관리용 메뉴 ID (일반 항목은 1부터 순차 할당)
-const (
-	idOpenFolder = 0xFFF0
-	idInstall    = 0xFFF1
-	idUpdate     = 0xFFF2
-
-	idCtxMoveBase = 0x2001 // 항목 우클릭 메뉴: 이동(카테고리별 +0..3)
-	idCtxDelete   = 0x2100 // 항목 우클릭 메뉴: 삭제
-)
-
 type point struct{ x, y int32 }
+type gdiSize struct{ cx, cy int32 }
+type rect struct{ left, top, right, bottom int32 }
+
+func (r rect) contains(x, y int32) bool {
+	return x >= r.left && x < r.right && y >= r.top && y < r.bottom
+}
 
 type wndClassEx struct {
 	cbSize        uint32
@@ -180,19 +228,22 @@ type wndClassEx struct {
 	hIconSm       windows.Handle
 }
 
-type menuItemInfo struct {
-	cbSize        uint32
-	fMask         uint32
-	fType         uint32
-	fState        uint32
-	wID           uint32
-	hSubMenu      windows.Handle
-	hbmpChecked   windows.Handle
-	hbmpUnchecked windows.Handle
-	dwItemData    uintptr
-	dwTypeData    *uint16
-	cch           uint32
-	hbmpItem      windows.Handle
+type msgStruct struct {
+	hwnd    windows.Handle
+	message uint32
+	wparam  uintptr
+	lparam  uintptr
+	time    uint32
+	pt      point
+}
+
+type paintStruct struct {
+	hdc         windows.Handle
+	fErase      int32
+	rcPaint     rect
+	fRestore    int32
+	fIncUpdate  int32
+	rgbReserved [32]byte
 }
 
 type shFileInfo struct {
@@ -203,29 +254,11 @@ type shFileInfo struct {
 	szTypeName    [80]uint16
 }
 
-type bitmapInfoHeader struct {
-	biSize          uint32
-	biWidth         int32
-	biHeight        int32
-	biPlanes        uint16
-	biBitCount      uint16
-	biCompression   uint32
-	biSizeImage     uint32
-	biXPelsPerMeter int32
-	biYPelsPerMeter int32
-	biClrUsed       uint32
-	biClrImportant  uint32
-}
-
-type bitmapInfo struct {
-	header bitmapInfoHeader
-	colors [1]uint32
-}
-
-type item struct {
-	label   string
-	path    string // ShellExecute 대상(바로가기 파일 자체)
-	iconSrc string // 아이콘을 가져올 경로
+type uiItem struct {
+	label string
+	path  string
+	icon  windows.Handle // HICON (없으면 0)
+	rc    rect
 }
 
 type updateInfo struct {
@@ -233,19 +266,49 @@ type updateInfo struct {
 	url string
 }
 
+// 히트 대상 종류
+const (
+	hitNone = iota
+	hitItem
+	hitUpdate
+	hitOpen
+	hitInstall
+)
+
+type hit struct {
+	kind int
+	cat  int
+	idx  int
+}
+
 type app struct {
 	dataDir string
-	nextID  uint32
-	cmds    map[uint32]string // 메뉴 ID → 실행할 경로
-	files   map[uint32]string // 메뉴 ID → 이동/삭제 가능한 파일 경로
-	bitmaps []windows.Handle
+	hwnd    windows.Handle
+	font    windows.Handle
 	iconCx  int32
 	iconCy  int32
-	rbPath  string // 항목 우클릭으로 이동/삭제 요청된 경로
+	dpi     int32
 
-	update        *updateInfo
-	updateCh      chan *updateInfo
-	updateChecked bool
+	items    [catCount][]uiItem
+	colBand  [catCount]rect // 드롭 대상 영역(헤더 포함 열 전체)
+	headerRc [catCount]rect
+	updRc    rect
+	openRc   rect
+	instRc   rect
+	showInst bool
+	winW     int32
+	winH     int32
+
+	hover    hit
+	pressed  hit
+	pressPt  point
+	dragging bool
+	dropCat  int
+
+	modal bool // MessageBox 표시 중(비활성화로 창이 닫히지 않게)
+
+	update   *updateInfo
+	updateCh chan *updateInfo
 }
 
 func main() {
@@ -292,7 +355,7 @@ func main() {
 		alert("gotool", err.Error(), mbIconError)
 		return
 	}
-	runMenu(dir)
+	runPanel(dir)
 }
 
 // resolveDir 는 표시할 폴더를 정한다. 인자로 폴더를 받으면 그 폴더,
@@ -316,130 +379,530 @@ func resolveDir(args []string) (string, error) {
 	return dir, nil
 }
 
-func runMenu(dir string) {
+// ---- 패널 창 ----
+
+func runPanel(dir string) {
 	a := &app{
 		dataDir:  dir,
-		iconCx:   getSystemMetrics(smCxSmIcon),
-		iconCy:   getSystemMetrics(smCySmIcon),
+		iconCx:   getSystemMetrics(smCxSmIcon, 16),
+		iconCy:   getSystemMetrics(smCySmIcon, 16),
 		updateCh: make(chan *updateInfo, 1),
+		hover:    hit{kind: hitNone},
+		pressed:  hit{kind: hitNone},
+		dropCat:  -1,
 	}
-	go checkUpdate(a.updateCh)
 
-	hwnd := createHiddenWindow(a)
-	if hwnd == 0 {
+	hdcScreen, _, _ := procGetDC.Call(0)
+	dpi, _, _ := procGetDeviceCaps.Call(hdcScreen, logPixelsY)
+	procReleaseDC.Call(0, hdcScreen)
+	a.dpi = int32(dpi)
+	if a.dpi <= 0 {
+		a.dpi = 96
+	}
+	a.font = createUIFont(a.dpi)
+	defer procDeleteObject.Call(uintptr(a.font))
+
+	if !a.createWindow() {
 		alert("gotool", "창을 생성하지 못했습니다.", mbIconError)
 		return
 	}
-	defer procDestroyWindow.Call(uintptr(hwnd))
 
+	a.reload()
+
+	// 커서 위치에 표시(화면 밖으로 나가지 않게 보정)
+	var pt point
+	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	vx := getSystemMetrics(smXVirtualScreen, 0)
+	vy := getSystemMetrics(smYVirtualScreen, 0)
+	vw := getSystemMetrics(smCxVirtualScreen, 1920)
+	vh := getSystemMetrics(smCyVirtualScreen, 1080)
+	x := pt.x
+	y := pt.y
+	if x+a.winW > vx+vw {
+		x = vx + vw - a.winW
+	}
+	if y+a.winH > vy+vh {
+		y = vy + vh - a.winH
+	}
+	if x < vx {
+		x = vx
+	}
+	if y < vy {
+		y = vy
+	}
+	procSetWindowPos.Call(uintptr(a.hwnd), 0, uintptr(x), uintptr(y), uintptr(a.winW), uintptr(a.winH), swpNoZorder)
+	procShowWindow.Call(uintptr(a.hwnd), swShow)
+	procSetForegroundWindow.Call(uintptr(a.hwnd))
+
+	// 업데이트 확인은 백그라운드로. 끝나면 UI 스레드에 알림.
+	go func() {
+		checkUpdate(a.updateCh)
+		procPostMessageW.Call(uintptr(a.hwnd), wmAppUpdate, 0, 0)
+	}()
+
+	var m msgStruct
 	for {
-		// 업데이트 확인 결과를 잠깐(최대 0.7초) 기다린다. 늦게 도착하면 다음 재표시 때 반영.
-		if !a.updateChecked {
-			select {
-			case u := <-a.updateCh:
+		r, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
+		if r == 0 || int32(r) == -1 {
+			break
+		}
+		procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
+		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))
+	}
+	a.freeIcons()
+}
+
+func (a *app) createWindow() bool {
+	hInst, _, _ := procGetModuleHandleW.Call(0)
+	className := utf16Ptr("gotoolPanelWnd")
+	arrow, _, _ := procLoadCursorW.Call(0, idcArrow)
+
+	wndProc := windows.NewCallback(a.wndProc)
+	wc := wndClassEx{
+		cbSize:        uint32(unsafe.Sizeof(wndClassEx{})),
+		lpfnWndProc:   wndProc,
+		hInstance:     windows.Handle(hInst),
+		hCursor:       windows.Handle(arrow),
+		lpszClassName: className,
+	}
+	procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
+
+	hwnd, _, _ := procCreateWindowExW.Call(
+		wsExTopmost|wsExToolWindow,
+		uintptr(unsafe.Pointer(className)),
+		uintptr(unsafe.Pointer(utf16Ptr("gotool"))),
+		wsPopup|wsBorder,
+		0, 0, 100, 100,
+		0, 0, hInst, 0,
+	)
+	a.hwnd = windows.Handle(hwnd)
+	return hwnd != 0
+}
+
+func (a *app) wndProc(hwnd, msg, wparam, lparam uintptr) uintptr {
+	switch msg {
+	case wmPaint:
+		var ps paintStruct
+		hdc, _, _ := procBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+		a.paint(hdc)
+		procEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+		return 0
+	case wmEraseBkgnd:
+		return 1
+	case wmMouseMove:
+		a.onMouseMove(mouseXY(lparam))
+		return 0
+	case wmLButtonDown:
+		a.onLButtonDown(mouseXY(lparam))
+		return 0
+	case wmLButtonUp:
+		a.onLButtonUp(mouseXY(lparam))
+		return 0
+	case wmRButtonUp:
+		a.onRButtonUp(mouseXY(lparam))
+		return 0
+	case wmSetCursor:
+		if a.dragging {
+			c, _, _ := procLoadCursorW.Call(0, idcSizeAll)
+			procSetCursor.Call(c)
+			return 1
+		}
+	case wmKeyDown:
+		if wparam == vkEscape {
+			procDestroyWindow.Call(hwnd)
+			return 0
+		}
+	case wmActivate:
+		if wparam&0xFFFF == waInactive && !a.modal && !a.dragging {
+			procDestroyWindow.Call(hwnd)
+			return 0
+		}
+	case wmAppUpdate:
+		select {
+		case u := <-a.updateCh:
+			if u != nil {
 				a.update = u
-				a.updateChecked = true
-			case <-time.After(700 * time.Millisecond):
+				a.refresh()
 			}
-		}
-
-		a.nextID = 1
-		a.cmds = map[uint32]string{}
-		a.files = map[uint32]string{}
-		a.rbPath = ""
-
-		menu := a.buildMenu()
-
-		var pt point
-		procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
-		procSetForegroundWindow.Call(uintptr(hwnd))
-
-		cmd, _, callErr := procTrackPopupMenuEx.Call(
-			uintptr(menu),
-			tpmReturnCmd,
-			uintptr(pt.x), uintptr(pt.y),
-			uintptr(hwnd), 0,
-		)
-
-		procDestroyMenu.Call(uintptr(menu))
-		for _, b := range a.bitmaps {
-			procDeleteObject.Call(uintptr(b))
-		}
-		a.bitmaps = nil
-
-		switch {
-		case cmd == uintptr(idUpdate):
-			if a.update != nil {
-				launch(a.update.url)
-			}
-			return
-		case cmd == uintptr(idOpenFolder):
-			launch(a.dataDir)
-			return
-		case cmd == uintptr(idInstall):
-			if err := installContextMenu(); err != nil {
-				alert("gotool", "우클릭 메뉴 등록 실패:\n"+err.Error(), mbIconError)
-			} else {
-				alert("gotool", "탐색기 우클릭 메뉴에 \"gotool에 추가\"를 등록했습니다.\n\nWindows 11에서는 우클릭 후 \"더 많은 옵션 표시\" 안에 나타납니다.", mbIconInformation)
-			}
-			continue // 메뉴 다시 표시
-		case cmd != 0:
-			if path, ok := a.cmds[uint32(cmd)]; ok {
-				launch(path)
-			}
-			return
-		case a.rbPath != "":
-			a.showItemMenu(hwnd, a.rbPath)
-			continue // 이동/삭제 후 메뉴 다시 표시
 		default:
-			// 취소. 실제 실패라면 원인을 표시한다.
-			if errno, ok := callErr.(syscall.Errno); ok && errno != 0 {
-				alert("gotool", fmt.Sprintf("메뉴를 표시하지 못했습니다.\n(오류 %d: %v)", uint32(errno), errno), mbIconError)
+		}
+		return 0
+	case wmDestroy:
+		procPostQuitMessage.Call(0)
+		return 0
+	}
+	r, _, _ := procDefWindowProcW.Call(hwnd, msg, wparam, lparam)
+	return r
+}
+
+func mouseXY(lparam uintptr) (int32, int32) {
+	return int32(int16(lparam & 0xFFFF)), int32(int16((lparam >> 16) & 0xFFFF))
+}
+
+func (a *app) scale(n int32) int32 { return n * a.dpi / 96 }
+
+// reload 는 폴더를 다시 읽고 아이콘/레이아웃을 계산한다.
+func (a *app) reload() {
+	a.freeIcons()
+
+	cats := a.scan()
+	for ci := 0; ci < catCount; ci++ {
+		a.items[ci] = nil
+		for _, it := range cats[ci] {
+			a.items[ci] = append(a.items[ci], uiItem{
+				label: it.label,
+				path:  it.path,
+				icon:  iconHandle(it.iconSrc),
+			})
+		}
+	}
+	a.showInst = !contextMenuInstalled()
+	a.layout()
+}
+
+func (a *app) freeIcons() {
+	for ci := range a.items {
+		for _, it := range a.items[ci] {
+			if it.icon != 0 {
+				procDestroyIcon.Call(uintptr(it.icon))
 			}
-			return
 		}
 	}
 }
 
-// showItemMenu 는 항목 우클릭 시 이동/삭제 팝업을 띄운다.
-func (a *app) showItemMenu(hwnd windows.Handle, path string) {
-	hMenu, _, _ := procCreatePopupMenu.Call()
-	menu := windows.Handle(hMenu)
-	defer procDestroyMenu.Call(uintptr(menu))
+// layout 은 열 너비/항목 좌표/버튼 좌표와 창 크기를 계산한다.
+func (a *app) layout() {
+	hdc, _, _ := procGetDC.Call(uintptr(a.hwnd))
+	oldFont, _, _ := procSelectObject.Call(hdc, uintptr(a.font))
 
-	var pos uint32
-	name := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	a.insertDisabled(menu, &pos, name)
-	a.insertSeparator(menu, &pos)
+	pad := a.scale(8)
+	rowH := a.iconCy + a.scale(10)
+	sepW := a.scale(11)
+	iconPad := a.scale(6)
+	minCol := a.scale(130)
+	maxCol := a.scale(330)
+
+	textW := func(s string) int32 {
+		u, err := windows.UTF16FromString(s)
+		if err != nil || len(u) <= 1 {
+			return 0
+		}
+		var sz gdiSize
+		procGetTextExtentPoint32W.Call(hdc, uintptr(unsafe.Pointer(&u[0])), uintptr(len(u)-1), uintptr(unsafe.Pointer(&sz)))
+		return sz.cx
+	}
+
+	var colW [catCount]int32
+	maxRows := 1
 	for ci := 0; ci < catCount; ci++ {
-		a.insertItem(menu, &pos, uint32(idCtxMoveBase+ci), "이동 → "+catNames[ci], 0)
+		w := textW(catNames[ci])
+		for _, it := range a.items[ci] {
+			if tw := textW(it.label); tw > w {
+				w = tw
+			}
+		}
+		w += a.iconCx + iconPad + pad*2
+		if w < minCol {
+			w = minCol
+		}
+		if w > maxCol {
+			w = maxCol
+		}
+		colW[ci] = w
+		if n := len(a.items[ci]); n > maxRows {
+			maxRows = n
+		}
 	}
-	a.insertSeparator(menu, &pos)
-	a.insertItem(menu, &pos, idCtxDelete, "🗑 삭제", 0)
 
-	var pt point
-	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
-	procSetForegroundWindow.Call(uintptr(hwnd))
-	cmd, _, _ := procTrackPopupMenuEx.Call(uintptr(menu), tpmReturnCmd, uintptr(pt.x), uintptr(pt.y), uintptr(hwnd), 0)
-
-	switch {
-	case cmd >= idCtxMoveBase && cmd < idCtxMoveBase+catCount:
-		a.moveToCat(path, int(cmd-idCtxMoveBase))
-	case cmd == uintptr(idCtxDelete):
-		a.confirmDelete(path)
+	topH := int32(0)
+	if a.update != nil {
+		topH = rowH + a.scale(6)
 	}
+
+	colTop := pad + topH
+	itemsBottom := colTop + rowH + int32(maxRows)*rowH // 헤더 + 항목들
+
+	x := pad
+	for ci := 0; ci < catCount; ci++ {
+		a.headerRc[ci] = rect{x, colTop, x + colW[ci], colTop + rowH}
+		y := colTop + rowH
+		for i := range a.items[ci] {
+			a.items[ci][i].rc = rect{x, y, x + colW[ci], y + rowH}
+			y += rowH
+		}
+		a.colBand[ci] = rect{x, colTop, x + colW[ci], itemsBottom}
+		x += colW[ci] + sepW
+	}
+	winW := x - sepW + pad
+
+	// 하단 관리 영역
+	y := itemsBottom + a.scale(6)
+	a.openRc = rect{pad, y, winW - pad, y + rowH}
+	y += rowH
+	if a.showInst {
+		a.instRc = rect{pad, y, winW - pad, y + rowH}
+		y += rowH
+	} else {
+		a.instRc = rect{}
+	}
+
+	if a.update != nil {
+		a.updRc = rect{pad, pad, winW - pad, pad + rowH}
+	} else {
+		a.updRc = rect{}
+	}
+
+	a.winW = winW
+	a.winH = y + pad
+
+	procSelectObject.Call(hdc, oldFont)
+	procReleaseDC.Call(uintptr(a.hwnd), hdc)
+}
+
+// refresh 는 재스캔 후 창 크기만 갱신하고(위치 유지) 다시 그린다.
+func (a *app) refresh() {
+	a.reload()
+	procSetWindowPos.Call(uintptr(a.hwnd), 0, 0, 0, uintptr(a.winW), uintptr(a.winH), swpNoMove|swpNoZorder)
+	procInvalidateRect.Call(uintptr(a.hwnd), 0, 1)
+}
+
+// ---- 그리기 ----
+
+func (a *app) paint(hdc uintptr) {
+	var rc rect
+	procGetClientRect.Call(uintptr(a.hwnd), uintptr(unsafe.Pointer(&rc)))
+	w, h := rc.right-rc.left, rc.bottom-rc.top
+
+	memDC, _, _ := procCreateCompatibleDC.Call(hdc)
+	memBmp, _, _ := procCreateCompatibleBitmap.Call(hdc, uintptr(w), uintptr(h))
+	oldBmp, _, _ := procSelectObject.Call(memDC, memBmp)
+	oldFont, _, _ := procSelectObject.Call(memDC, uintptr(a.font))
+	procSetBkMode.Call(memDC, bkTransparent)
+
+	brush := func(idx uintptr) uintptr { b, _, _ := procGetSysColorBrush.Call(idx); return b }
+	color := func(idx uintptr) uintptr { c, _, _ := procGetSysColor.Call(idx); return c }
+
+	procFillRect.Call(memDC, uintptr(unsafe.Pointer(&rc)), brush(colorMenu))
+
+	drawText := func(r rect, s string, col uintptr) {
+		u, err := windows.UTF16FromString(s)
+		if err != nil {
+			return
+		}
+		procSetTextColor.Call(memDC, col)
+		procDrawTextW.Call(memDC, uintptr(unsafe.Pointer(&u[0])), ^uintptr(0), uintptr(unsafe.Pointer(&r)), dtFlags)
+	}
+
+	rowText := func(r rect, label string, icon windows.Handle, hovered, grayed bool) {
+		if hovered {
+			procFillRect.Call(memDC, uintptr(unsafe.Pointer(&r)), brush(colorHighlight))
+		}
+		x := r.left + a.scale(8)
+		if icon != 0 {
+			iy := r.top + (r.bottom-r.top-a.iconCy)/2
+			procDrawIconEx.Call(memDC, uintptr(x), uintptr(iy), uintptr(icon), uintptr(a.iconCx), uintptr(a.iconCy), 0, 0, diNormal)
+		}
+		tr := r
+		tr.left = x + a.iconCx + a.scale(6)
+		col := color(colorMenuText)
+		if grayed {
+			col = color(colorGrayText)
+		}
+		if hovered {
+			col = color(colorHighlightText)
+		}
+		drawText(tr, label, col)
+	}
+
+	// 업데이트 버튼
+	if a.update != nil {
+		rowText(a.updRc, "⬆ 새 버전 "+a.update.tag+" 다운로드", 0, a.hover.kind == hitUpdate, false)
+		line := rect{a.updRc.left, a.updRc.bottom + a.scale(2), a.updRc.right, a.updRc.bottom + a.scale(3)}
+		procFillRect.Call(memDC, uintptr(unsafe.Pointer(&line)), brush(color3DShadow))
+	}
+
+	// 열
+	for ci := 0; ci < catCount; ci++ {
+		hr := a.headerRc[ci]
+		drawText(rect{hr.left + a.scale(8), hr.top, hr.right, hr.bottom}, catNames[ci], color(colorGrayText))
+		line := rect{hr.left, hr.bottom - a.scale(2), hr.right, hr.bottom - a.scale(1)}
+		procFillRect.Call(memDC, uintptr(unsafe.Pointer(&line)), brush(color3DShadow))
+
+		if len(a.items[ci]) == 0 {
+			r := rect{hr.left, hr.bottom, hr.right, hr.bottom + a.iconCy + a.scale(10)}
+			drawText(rect{r.left + a.scale(8), r.top, r.right, r.bottom}, "(비어 있음)", color(colorGrayText))
+		}
+		for i, it := range a.items[ci] {
+			hovered := !a.dragging && a.hover.kind == hitItem && a.hover.cat == ci && a.hover.idx == i
+			graying := a.dragging && a.pressed.kind == hitItem && a.pressed.cat == ci && a.pressed.idx == i
+			rowText(it.rc, it.label, it.icon, hovered, graying)
+		}
+		// 열 구분선
+		if ci < catCount-1 {
+			sx := a.colBand[ci].right + a.scale(5)
+			line := rect{sx, a.colBand[ci].top, sx + a.scale(1), a.colBand[ci].bottom}
+			procFillRect.Call(memDC, uintptr(unsafe.Pointer(&line)), brush(color3DShadow))
+		}
+	}
+
+	// 드래그 중: 드롭 대상 열 강조
+	if a.dragging && a.dropCat >= 0 {
+		band := a.colBand[a.dropCat]
+		procFrameRect.Call(memDC, uintptr(unsafe.Pointer(&band)), brush(colorHighlight))
+		inner := rect{band.left + 1, band.top + 1, band.right - 1, band.bottom - 1}
+		procFrameRect.Call(memDC, uintptr(unsafe.Pointer(&inner)), brush(colorHighlight))
+	}
+
+	// 하단 관리 영역
+	line := rect{a.openRc.left, a.openRc.top - a.scale(3), a.openRc.right, a.openRc.top - a.scale(2)}
+	procFillRect.Call(memDC, uintptr(unsafe.Pointer(&line)), brush(color3DShadow))
+	rowText(a.openRc, "⚙ 바로가기 폴더 열기 (추가·수정·삭제)", 0, a.hover.kind == hitOpen, false)
+	if a.showInst {
+		rowText(a.instRc, "🖱 우클릭 \"gotool에 추가\" 메뉴 등록", 0, a.hover.kind == hitInstall, false)
+	}
+
+	procBitBlt.Call(hdc, 0, 0, uintptr(w), uintptr(h), memDC, 0, 0, srcCopy)
+
+	procSelectObject.Call(memDC, oldFont)
+	procSelectObject.Call(memDC, oldBmp)
+	procDeleteObject.Call(memBmp)
+	procDeleteDC.Call(memDC)
+}
+
+// ---- 마우스 처리 ----
+
+func (a *app) hitTest(x, y int32) hit {
+	if a.update != nil && a.updRc.contains(x, y) {
+		return hit{kind: hitUpdate}
+	}
+	if a.openRc.contains(x, y) {
+		return hit{kind: hitOpen}
+	}
+	if a.showInst && a.instRc.contains(x, y) {
+		return hit{kind: hitInstall}
+	}
+	for ci := 0; ci < catCount; ci++ {
+		for i := range a.items[ci] {
+			if a.items[ci][i].rc.contains(x, y) {
+				return hit{kind: hitItem, cat: ci, idx: i}
+			}
+		}
+	}
+	return hit{kind: hitNone}
+}
+
+func (a *app) onMouseMove(x, y int32) {
+	if a.pressed.kind == hitItem {
+		dx, dy := x-a.pressPt.x, y-a.pressPt.y
+		if !a.dragging && (dx*dx+dy*dy) > a.scale(4)*a.scale(4) {
+			a.dragging = true
+		}
+	}
+	if a.dragging {
+		drop := -1
+		for ci := 0; ci < catCount; ci++ {
+			if a.colBand[ci].contains(x, y) {
+				drop = ci
+				break
+			}
+		}
+		if drop != a.dropCat {
+			a.dropCat = drop
+			procInvalidateRect.Call(uintptr(a.hwnd), 0, 0)
+		}
+		return
+	}
+	h := a.hitTest(x, y)
+	if h != a.hover {
+		a.hover = h
+		procInvalidateRect.Call(uintptr(a.hwnd), 0, 0)
+	}
+}
+
+func (a *app) onLButtonDown(x, y int32) {
+	a.pressed = a.hitTest(x, y)
+	a.pressPt = point{x, y}
+	a.dragging = false
+	a.dropCat = -1
+	if a.pressed.kind != hitNone {
+		procSetCapture.Call(uintptr(a.hwnd))
+	}
+}
+
+func (a *app) onLButtonUp(x, y int32) {
+	procReleaseCapture.Call()
+
+	if a.dragging {
+		// 드롭: 다른 열이면 이동. 창은 닫지 않고 제자리 유지.
+		if a.pressed.kind == hitItem && a.dropCat >= 0 {
+			src := a.items[a.pressed.cat][a.pressed.idx]
+			if a.dropCat != a.pressed.cat {
+				a.moveToCat(src.path, a.dropCat)
+			}
+		}
+		a.dragging = false
+		a.dropCat = -1
+		a.pressed = hit{kind: hitNone}
+		a.refresh()
+		return
+	}
+
+	prev := a.pressed
+	a.pressed = hit{kind: hitNone}
+	if prev.kind == hitNone || a.hitTest(x, y) != prev {
+		return
+	}
+
+	switch prev.kind {
+	case hitItem:
+		launch(a.items[prev.cat][prev.idx].path)
+		procDestroyWindow.Call(uintptr(a.hwnd))
+	case hitUpdate:
+		if a.update != nil {
+			launch(a.update.url)
+		}
+		procDestroyWindow.Call(uintptr(a.hwnd))
+	case hitOpen:
+		launch(a.dataDir)
+		procDestroyWindow.Call(uintptr(a.hwnd))
+	case hitInstall:
+		a.modal = true
+		if err := installContextMenu(); err != nil {
+			alert("gotool", "우클릭 메뉴 등록 실패:\n"+err.Error(), mbIconError)
+		} else {
+			alert("gotool", "탐색기 우클릭 메뉴에 \"gotool에 추가\"를 등록했습니다.\n\nWindows 11에서는 우클릭 후 \"더 많은 옵션 표시\" 안에 나타납니다.", mbIconInformation)
+		}
+		a.modal = false
+		procSetForegroundWindow.Call(uintptr(a.hwnd))
+		a.refresh()
+	}
+}
+
+func (a *app) onRButtonUp(x, y int32) {
+	h := a.hitTest(x, y)
+	if h.kind != hitItem {
+		return
+	}
+	a.confirmDelete(a.items[h.cat][h.idx].path)
+	a.hover = hit{kind: hitNone}
+	a.refresh()
 }
 
 // moveToCat 은 항목 파일을 카테고리 강제 폴더로 옮긴다.
 func (a *app) moveToCat(path string, cat int) {
-	dir := a.catDir(cat)
+	dir := filepath.Join(a.dataDir, catFolderNames[cat])
 	if err := os.MkdirAll(dir, 0o755); err != nil {
+		a.modal = true
 		alert("gotool", "폴더를 만들 수 없습니다:\n"+err.Error(), mbIconError)
+		a.modal = false
 		return
 	}
 	dest := uniqueDest(dir, filepath.Base(path))
 	if err := os.Rename(path, dest); err != nil {
+		a.modal = true
 		alert("gotool", "이동하지 못했습니다:\n"+err.Error(), mbIconError)
+		a.modal = false
+		procSetForegroundWindow.Call(uintptr(a.hwnd))
 	}
 }
 
@@ -450,57 +913,29 @@ func (a *app) confirmDelete(path string) {
 		return
 	}
 	name := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	r, _, _ := procMessageBoxW.Call(0,
+	a.modal = true
+	r, _, _ := procMessageBoxW.Call(uintptr(a.hwnd),
 		uintptr(unsafe.Pointer(utf16Ptr(fmt.Sprintf("\"%s\" 을(를) 삭제할까요?\n\n%s", name, path)))),
 		uintptr(unsafe.Pointer(utf16Ptr("gotool - 바로가기 삭제"))),
 		mbYesNo|mbIconWarning)
+	a.modal = false
+	procSetForegroundWindow.Call(uintptr(a.hwnd))
 	if r != idYes {
 		return
 	}
 	if err := os.RemoveAll(path); err != nil {
+		a.modal = true
 		alert("gotool", "삭제하지 못했습니다:\n"+err.Error(), mbIconError)
+		a.modal = false
 	}
 }
 
-// ---- 메뉴 구성 ----
+// ---- 폴더 스캔/분류 ----
 
-func (a *app) buildMenu() windows.Handle {
-	hMenu, _, _ := procCreatePopupMenu.Call()
-	menu := windows.Handle(hMenu)
-
-	cats := a.scan()
-	var pos uint32
-
-	if a.update != nil {
-		a.insertItem(menu, &pos, idUpdate, "⬆ 새 버전 "+a.update.tag+" 다운로드", 0)
-		a.insertSeparator(menu, &pos)
-	}
-
-	for ci := 0; ci < catCount; ci++ {
-		a.insertHeader(menu, &pos, catNames[ci], ci > 0)
-		if len(cats[ci]) == 0 {
-			a.insertDisabled(menu, &pos, "    (비어 있음)")
-		}
-		for _, it := range cats[ci] {
-			id := a.nextID
-			a.nextID++
-			a.cmds[id] = it.path
-			a.files[id] = it.path
-			a.insertItem(menu, &pos, id, it.label, a.iconBitmap(it.iconSrc))
-		}
-	}
-
-	// 마지막 열 하단: 관리 항목
-	a.insertSeparator(menu, &pos)
-	a.insertItem(menu, &pos, idOpenFolder, "⚙ 바로가기 폴더 열기 (추가·수정·삭제)", 0)
-	if !contextMenuInstalled() {
-		a.insertItem(menu, &pos, idInstall, "🖱 우클릭 \"gotool에 추가\" 메뉴 등록", 0)
-	}
-	return menu
-}
-
-func (a *app) catDir(cat int) string {
-	return filepath.Join(a.dataDir, catFolderNames[cat])
+type item struct {
+	label   string
+	path    string
+	iconSrc string
 }
 
 // scan 은 데이터 폴더의 항목을 읽어 4개 카테고리로 나눈다.
@@ -508,7 +943,8 @@ func (a *app) catDir(cat int) string {
 func (a *app) scan() [catCount][]item {
 	var cats [catCount][]item
 
-	seen, seenChanged := a.loadSeen()
+	seen := a.loadSeen()
+	seenChanged := false
 	now := time.Now().Unix()
 	present := map[string]bool{}
 
@@ -526,14 +962,14 @@ func (a *app) scan() [catCount][]item {
 			label = strings.TrimSuffix(base, filepath.Ext(base))
 		}
 		if time.Duration(now-first)*time.Second < newBadgeAge {
-			label = "! " + label
+			label += " !" // 신규 표시(오른쪽)
 		}
 		cats[cat] = append(cats[cat], item{label: label, path: full, iconSrc: iconSrc})
 	}
 
 	// 카테고리 강제 폴더
 	for ci := 0; ci < catCount; ci++ {
-		dir := a.catDir(ci)
+		dir := filepath.Join(a.dataDir, catFolderNames[ci])
 		os.MkdirAll(dir, 0o755)
 		entries, err := os.ReadDir(dir)
 		if err != nil {
@@ -604,11 +1040,11 @@ func (a *app) seenPath() string {
 	return filepath.Join(a.dataDir, ".seen")
 }
 
-func (a *app) loadSeen() (map[string]int64, bool) {
+func (a *app) loadSeen() map[string]int64 {
 	m := map[string]int64{}
 	data, err := os.ReadFile(a.seenPath())
 	if err != nil {
-		return m, false
+		return m
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimRight(line, "\r")
@@ -622,7 +1058,7 @@ func (a *app) loadSeen() (map[string]int64, bool) {
 		}
 		m[line[:i]] = ts
 	}
-	return m, false
+	return m
 }
 
 func (a *app) saveSeen(m map[string]int64) {
@@ -715,7 +1151,7 @@ func checkUpdate(ch chan<- *updateInfo) {
 		}
 	}
 
-	client := &http.Client{Timeout: 2 * time.Second}
+	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", repoOwner, repoName))
 	if err != nil {
 		send(nil)
@@ -780,62 +1216,10 @@ func verNums(v string) [3]int {
 	return out
 }
 
-// ---- 메뉴 항목 삽입 ----
+// ---- 아이콘/폰트 ----
 
-func (a *app) insertHeader(menu windows.Handle, pos *uint32, text string, columnBreak bool) {
-	mii := menuItemInfo{
-		cbSize:     uint32(unsafe.Sizeof(menuItemInfo{})),
-		fMask:      miimString | miimState | miimFType,
-		fState:     mfsGrayed,
-		dwTypeData: utf16Ptr(text),
-	}
-	if columnBreak {
-		mii.fType = mftMenuBarBreak
-	}
-	procInsertMenuItemW.Call(uintptr(menu), uintptr(*pos), 1, uintptr(unsafe.Pointer(&mii)))
-	*pos++
-}
-
-func (a *app) insertDisabled(menu windows.Handle, pos *uint32, text string) {
-	mii := menuItemInfo{
-		cbSize:     uint32(unsafe.Sizeof(menuItemInfo{})),
-		fMask:      miimString | miimState,
-		fState:     mfsGrayed,
-		dwTypeData: utf16Ptr(text),
-	}
-	procInsertMenuItemW.Call(uintptr(menu), uintptr(*pos), 1, uintptr(unsafe.Pointer(&mii)))
-	*pos++
-}
-
-func (a *app) insertSeparator(menu windows.Handle, pos *uint32) {
-	mii := menuItemInfo{
-		cbSize: uint32(unsafe.Sizeof(menuItemInfo{})),
-		fMask:  miimFType,
-		fType:  mftSeparator,
-	}
-	procInsertMenuItemW.Call(uintptr(menu), uintptr(*pos), 1, uintptr(unsafe.Pointer(&mii)))
-	*pos++
-}
-
-func (a *app) insertItem(menu windows.Handle, pos *uint32, id uint32, label string, bmp windows.Handle) {
-	mii := menuItemInfo{
-		cbSize:     uint32(unsafe.Sizeof(menuItemInfo{})),
-		fMask:      miimString | miimID,
-		wID:        id,
-		dwTypeData: utf16Ptr(strings.ReplaceAll(label, "&", "&&")),
-	}
-	if bmp != 0 {
-		mii.fMask |= miimBitmap
-		mii.hbmpItem = bmp
-	}
-	procInsertMenuItemW.Call(uintptr(menu), uintptr(*pos), 1, uintptr(unsafe.Pointer(&mii)))
-	*pos++
-}
-
-// ---- 아이콘 ----
-
-// iconBitmap 은 경로의 셸 아이콘을 메뉴용 32bpp HBITMAP으로 만든다.
-func (a *app) iconBitmap(path string) windows.Handle {
+// iconHandle 은 경로의 셸 아이콘(HICON)을 얻는다. 쓰고 나면 DestroyIcon 필요.
+func iconHandle(path string) windows.Handle {
 	if path == "" {
 		return 0
 	}
@@ -849,48 +1233,26 @@ func (a *app) iconBitmap(path string) windows.Handle {
 		uintptr(unsafe.Pointer(&sfi)), unsafe.Sizeof(sfi),
 		shgfiIcon|shgfiSmallIcon,
 	)
-	if r == 0 || sfi.hIcon == 0 {
+	if r == 0 {
 		return 0
 	}
-	defer procDestroyIcon.Call(uintptr(sfi.hIcon))
-
-	bmp := a.bitmapFromIcon(sfi.hIcon)
-	if bmp != 0 {
-		a.bitmaps = append(a.bitmaps, bmp)
-	}
-	return bmp
+	return sfi.hIcon
 }
 
-func (a *app) bitmapFromIcon(icon windows.Handle) windows.Handle {
-	hdc, _, _ := procGetDC.Call(0)
-	if hdc == 0 {
-		return 0
-	}
-	defer procReleaseDC.Call(0, hdc)
-
-	memDC, _, _ := procCreateCompatibleDC.Call(hdc)
-	if memDC == 0 {
-		return 0
-	}
-	defer procDeleteDC.Call(memDC)
-
-	bi := bitmapInfo{header: bitmapInfoHeader{
-		biSize:     uint32(unsafe.Sizeof(bitmapInfoHeader{})),
-		biWidth:    a.iconCx,
-		biHeight:   -a.iconCy, // top-down
-		biPlanes:   1,
-		biBitCount: 32,
-	}}
-	var bits uintptr
-	hbmp, _, _ := procCreateDIBSection.Call(hdc, uintptr(unsafe.Pointer(&bi)), dibRGBColors, uintptr(unsafe.Pointer(&bits)), 0, 0)
-	if hbmp == 0 {
-		return 0
-	}
-
-	old, _, _ := procSelectObject.Call(memDC, hbmp)
-	procDrawIconEx.Call(memDC, 0, 0, uintptr(icon), uintptr(a.iconCx), uintptr(a.iconCy), 0, 0, diNormal)
-	procSelectObject.Call(memDC, old)
-	return windows.Handle(hbmp)
+func createUIFont(dpi int32) windows.Handle {
+	height := -(9 * dpi) / 72 // 9pt
+	face := utf16Ptr("맑은 고딕")
+	f, _, _ := procCreateFontW.Call(
+		uintptr(int(height)), 0, 0, 0,
+		400, // FW_NORMAL
+		0, 0, 0,
+		1, // DEFAULT_CHARSET
+		0, 0,
+		5, // CLEARTYPE_QUALITY
+		0,
+		uintptr(unsafe.Pointer(face)),
+	)
+	return windows.Handle(f)
 }
 
 // ---- 추가(add) ----
@@ -937,7 +1299,7 @@ func addItem(src string) {
 
 	cat, _ := classifyAuto(dest, false)
 	label := strings.TrimSuffix(filepath.Base(dest), filepath.Ext(dest))
-	alert("gotool", fmt.Sprintf("추가되었습니다: %s\n분류: %s\n\n(메뉴에서 항목을 우클릭하면 다른 열로 옮길 수 있습니다)", label, catNames[cat]), mbIconInformation)
+	alert("gotool", fmt.Sprintf("추가되었습니다: %s\n분류: %s\n\n(메뉴에서 항목을 드래그하면 다른 열로 옮길 수 있습니다)", label, catNames[cat]), mbIconInformation)
 }
 
 func uniqueDest(dir, name string) string {
@@ -1100,7 +1462,7 @@ func createLnk(target, dest string) error {
 	return nil
 }
 
-// ---- 창/공용 ----
+// ---- 공용 ----
 
 func launch(path string) {
 	op, _ := windows.UTF16PtrFromString("open")
@@ -1108,47 +1470,10 @@ func launch(path string) {
 	procShellExecuteW.Call(0, uintptr(unsafe.Pointer(op)), uintptr(unsafe.Pointer(p)), 0, 0, swShowNormal)
 }
 
-func createHiddenWindow(a *app) windows.Handle {
-	hInst, _, _ := procGetModuleHandleW.Call(0)
-	className := utf16Ptr("gotoolLauncherWnd")
-
-	wndProc := windows.NewCallback(func(hwnd, msg, wparam, lparam uintptr) uintptr {
-		if msg == wmMenuRButtonUp {
-			// wparam=항목 위치, lparam=HMENU. 이동/삭제 가능한 항목이면 메뉴를 닫고 처리 흐름으로.
-			idr, _, _ := procGetMenuItemID.Call(lparam, wparam)
-			if path, ok := a.files[uint32(idr)]; ok {
-				a.rbPath = path
-				procEndMenu.Call()
-			}
-			return 0
-		}
-		r, _, _ := procDefWindowProcW.Call(hwnd, msg, wparam, lparam)
-		return r
-	})
-
-	wc := wndClassEx{
-		cbSize:        uint32(unsafe.Sizeof(wndClassEx{})),
-		lpfnWndProc:   wndProc,
-		hInstance:     windows.Handle(hInst),
-		lpszClassName: className,
-	}
-	procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
-
-	hwnd, _, _ := procCreateWindowExW.Call(
-		0,
-		uintptr(unsafe.Pointer(className)),
-		0,
-		wsPopup,
-		0, 0, 0, 0,
-		0, 0, hInst, 0,
-	)
-	return windows.Handle(hwnd)
-}
-
-func getSystemMetrics(index int32) int32 {
+func getSystemMetrics(index int32, fallback int32) int32 {
 	r, _, _ := procGetSystemMetrics.Call(uintptr(index))
-	if r == 0 {
-		return 16
+	if int32(r) == 0 && (index == smCxSmIcon || index == smCySmIcon || index == smCxVirtualScreen || index == smCyVirtualScreen) {
+		return fallback
 	}
 	return int32(r)
 }
