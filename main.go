@@ -1,12 +1,12 @@
 //go:build windows
 
 // gotool — 즐겨찾기(바로가기) 런처.
-// 실행하면 마우스 커서 위치에 우클릭 메뉴 모양의 3열 팝업(웹 즐겨찾기 | 앱 | 폴더)이 뜨고,
-// 항목을 클릭하면 실행, 우클릭하면 삭제할 수 있다.
+// 실행하면 마우스 커서 위치에 우클릭 메뉴 모양의 4열 팝업(웹 | 개발 | 비개발 | 다람쥐)이 뜨고,
+// 왼쪽 클릭은 실행, 오른쪽 클릭은 이동/삭제 메뉴를 연다.
 //
 // 사용법:
 //
-//	gotool.exe              exe 옆 shortcuts 폴더의 내용을 3열 메뉴로 표시
+//	gotool.exe              exe 옆 shortcuts 폴더의 내용을 4열 메뉴로 표시
 //	gotool.exe <폴더>       지정한 폴더의 내용을 표시
 //	gotool.exe add <경로>   파일/폴더를 shortcuts 폴더에 추가 (.lnk/.url은 복사, 그 외는 바로가기 생성)
 //	gotool.exe install      탐색기 우클릭 메뉴에 "gotool에 추가" 등록
@@ -14,18 +14,32 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
 	neturl "net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
+)
+
+// 릴리스 빌드 시 ldflags 로 주입된다: -X main.version=v0.3.0
+var version = "v0.0.0"
+
+const (
+	repoOwner = "yuchoi-bb"
+	repoName  = "gotool"
+
+	newBadgeAge = 72 * time.Hour // 추가된 지 이 기간 안이면 이름 앞에 "!" 표시
 )
 
 // Win32 창/메뉴는 만든 스레드에서만 다룰 수 있으므로 main 고루틴을 OS 스레드에 고정한다.
@@ -118,17 +132,35 @@ const (
 // 카테고리(=메뉴 열)
 const (
 	catWeb = iota
-	catApp
-	catFolder
+	catDev
+	catEtc
+	catSquirrel
 	catCount
 )
 
-var catNames = [catCount]string{"🌐 웹 즐겨찾기", "🚀 앱", "📁 폴더"}
+var catNames = [catCount]string{"🌐 웹", "💻 개발", "📦 비개발", "🐿 다람쥐"}
+
+// shortcuts 폴더 안에서 카테고리를 강제하는 하위 폴더 이름.
+// 이 폴더 안에 넣은(탐색기에서 드래그한) 항목은 자동 분류 대신 해당 열에 표시된다.
+var catFolderNames = [catCount]string{"웹", "개발", "비개발", "다람쥐"}
+
+// 자동 분류에서 "개발"로 판정할 키워드(바로가기 이름/대상 경로에 포함되면 개발)
+var devKeywords = []string{
+	"code", "studio", "git", "docker", "python", "pycharm", "intellij", "idea",
+	"webstorm", "goland", "clion", "rider", "devenv", "node", "npm", "sql",
+	"vim", "sublime", "eclipse", "unity", "unreal", "android", "sdk",
+	"terminal", "cmd", "powershell", "putty", "ssh", "postman", "notepad++",
+	"dbeaver", "cursor", "wsl", "개발",
+}
 
 // 관리용 메뉴 ID (일반 항목은 1부터 순차 할당)
 const (
 	idOpenFolder = 0xFFF0
 	idInstall    = 0xFFF1
+	idUpdate     = 0xFFF2
+
+	idCtxMoveBase = 0x2001 // 항목 우클릭 메뉴: 이동(카테고리별 +0..3)
+	idCtxDelete   = 0x2100 // 항목 우클릭 메뉴: 삭제
 )
 
 type point struct{ x, y int32 }
@@ -196,15 +228,24 @@ type item struct {
 	iconSrc string // 아이콘을 가져올 경로
 }
 
+type updateInfo struct {
+	tag string
+	url string
+}
+
 type app struct {
 	dataDir string
 	nextID  uint32
 	cmds    map[uint32]string // 메뉴 ID → 실행할 경로
-	files   map[uint32]string // 메뉴 ID → 삭제 가능한 파일 경로
+	files   map[uint32]string // 메뉴 ID → 이동/삭제 가능한 파일 경로
 	bitmaps []windows.Handle
 	iconCx  int32
 	iconCy  int32
-	rbPath  string // 항목 우클릭으로 삭제 요청된 경로
+	rbPath  string // 항목 우클릭으로 이동/삭제 요청된 경로
+
+	update        *updateInfo
+	updateCh      chan *updateInfo
+	updateChecked bool
 }
 
 func main() {
@@ -277,10 +318,12 @@ func resolveDir(args []string) (string, error) {
 
 func runMenu(dir string) {
 	a := &app{
-		dataDir: dir,
-		iconCx:  getSystemMetrics(smCxSmIcon),
-		iconCy:  getSystemMetrics(smCySmIcon),
+		dataDir:  dir,
+		iconCx:   getSystemMetrics(smCxSmIcon),
+		iconCy:   getSystemMetrics(smCySmIcon),
+		updateCh: make(chan *updateInfo, 1),
 	}
+	go checkUpdate(a.updateCh)
 
 	hwnd := createHiddenWindow(a)
 	if hwnd == 0 {
@@ -290,6 +333,16 @@ func runMenu(dir string) {
 	defer procDestroyWindow.Call(uintptr(hwnd))
 
 	for {
+		// 업데이트 확인 결과를 잠깐(최대 0.7초) 기다린다. 늦게 도착하면 다음 재표시 때 반영.
+		if !a.updateChecked {
+			select {
+			case u := <-a.updateCh:
+				a.update = u
+				a.updateChecked = true
+			case <-time.After(700 * time.Millisecond):
+			}
+		}
+
 		a.nextID = 1
 		a.cmds = map[uint32]string{}
 		a.files = map[uint32]string{}
@@ -315,6 +368,11 @@ func runMenu(dir string) {
 		a.bitmaps = nil
 
 		switch {
+		case cmd == uintptr(idUpdate):
+			if a.update != nil {
+				launch(a.update.url)
+			}
+			return
 		case cmd == uintptr(idOpenFolder):
 			launch(a.dataDir)
 			return
@@ -331,8 +389,8 @@ func runMenu(dir string) {
 			}
 			return
 		case a.rbPath != "":
-			a.confirmDelete(a.rbPath)
-			continue // 삭제 후 메뉴 다시 표시
+			a.showItemMenu(hwnd, a.rbPath)
+			continue // 이동/삭제 후 메뉴 다시 표시
 		default:
 			// 취소. 실제 실패라면 원인을 표시한다.
 			if errno, ok := callErr.(syscall.Errno); ok && errno != 0 {
@@ -340,6 +398,48 @@ func runMenu(dir string) {
 			}
 			return
 		}
+	}
+}
+
+// showItemMenu 는 항목 우클릭 시 이동/삭제 팝업을 띄운다.
+func (a *app) showItemMenu(hwnd windows.Handle, path string) {
+	hMenu, _, _ := procCreatePopupMenu.Call()
+	menu := windows.Handle(hMenu)
+	defer procDestroyMenu.Call(uintptr(menu))
+
+	var pos uint32
+	name := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	a.insertDisabled(menu, &pos, name)
+	a.insertSeparator(menu, &pos)
+	for ci := 0; ci < catCount; ci++ {
+		a.insertItem(menu, &pos, uint32(idCtxMoveBase+ci), "이동 → "+catNames[ci], 0)
+	}
+	a.insertSeparator(menu, &pos)
+	a.insertItem(menu, &pos, idCtxDelete, "🗑 삭제", 0)
+
+	var pt point
+	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	procSetForegroundWindow.Call(uintptr(hwnd))
+	cmd, _, _ := procTrackPopupMenuEx.Call(uintptr(menu), tpmReturnCmd, uintptr(pt.x), uintptr(pt.y), uintptr(hwnd), 0)
+
+	switch {
+	case cmd >= idCtxMoveBase && cmd < idCtxMoveBase+catCount:
+		a.moveToCat(path, int(cmd-idCtxMoveBase))
+	case cmd == uintptr(idCtxDelete):
+		a.confirmDelete(path)
+	}
+}
+
+// moveToCat 은 항목 파일을 카테고리 강제 폴더로 옮긴다.
+func (a *app) moveToCat(path string, cat int) {
+	dir := a.catDir(cat)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		alert("gotool", "폴더를 만들 수 없습니다:\n"+err.Error(), mbIconError)
+		return
+	}
+	dest := uniqueDest(dir, filepath.Base(path))
+	if err := os.Rename(path, dest); err != nil {
+		alert("gotool", "이동하지 못했습니다:\n"+err.Error(), mbIconError)
 	}
 }
 
@@ -370,6 +470,12 @@ func (a *app) buildMenu() windows.Handle {
 
 	cats := a.scan()
 	var pos uint32
+
+	if a.update != nil {
+		a.insertItem(menu, &pos, idUpdate, "⬆ 새 버전 "+a.update.tag+" 다운로드", 0)
+		a.insertSeparator(menu, &pos)
+	}
+
 	for ci := 0; ci < catCount; ci++ {
 		a.insertHeader(menu, &pos, catNames[ci], ci > 0)
 		if len(cats[ci]) == 0 {
@@ -393,26 +499,84 @@ func (a *app) buildMenu() windows.Handle {
 	return menu
 }
 
-// scan 은 데이터 폴더의 항목을 읽어 3개 카테고리로 분류한다.
+func (a *app) catDir(cat int) string {
+	return filepath.Join(a.dataDir, catFolderNames[cat])
+}
+
+// scan 은 데이터 폴더의 항목을 읽어 4개 카테고리로 나눈다.
+// 루트의 항목은 자동 분류, 카테고리 하위 폴더(웹/개발/비개발/다람쥐) 안의 항목은 그 열로 강제.
 func (a *app) scan() [catCount][]item {
 	var cats [catCount][]item
-	entries, err := os.ReadDir(a.dataDir)
-	if err != nil {
-		return cats
-	}
-	for _, e := range entries {
-		name := e.Name()
-		if strings.HasPrefix(name, ".") || strings.EqualFold(name, "desktop.ini") {
-			continue
+
+	seen, seenChanged := a.loadSeen()
+	now := time.Now().Unix()
+	present := map[string]bool{}
+
+	appendItem := func(full string, isDir bool, cat int, iconSrc string) {
+		base := filepath.Base(full)
+		present[base] = true
+		first, ok := seen[base]
+		if !ok {
+			seen[base] = now
+			first = now
+			seenChanged = true
 		}
-		full := filepath.Join(a.dataDir, name)
-		cat, iconSrc := classify(full, e.IsDir())
-		label := name
-		if !e.IsDir() {
-			label = strings.TrimSuffix(name, filepath.Ext(name))
+		label := base
+		if !isDir {
+			label = strings.TrimSuffix(base, filepath.Ext(base))
+		}
+		if time.Duration(now-first)*time.Second < newBadgeAge {
+			label = "! " + label
 		}
 		cats[cat] = append(cats[cat], item{label: label, path: full, iconSrc: iconSrc})
 	}
+
+	// 카테고리 강제 폴더
+	for ci := 0; ci < catCount; ci++ {
+		dir := a.catDir(ci)
+		os.MkdirAll(dir, 0o755)
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if skipName(e.Name()) {
+				continue
+			}
+			full := filepath.Join(dir, e.Name())
+			_, iconSrc := classifyAuto(full, e.IsDir())
+			appendItem(full, e.IsDir(), ci, iconSrc)
+		}
+	}
+
+	// 루트: 자동 분류
+	entries, err := os.ReadDir(a.dataDir)
+	if err == nil {
+		for _, e := range entries {
+			name := e.Name()
+			if skipName(name) {
+				continue
+			}
+			if e.IsDir() && isCatFolder(name) {
+				continue
+			}
+			full := filepath.Join(a.dataDir, name)
+			cat, iconSrc := classifyAuto(full, e.IsDir())
+			appendItem(full, e.IsDir(), cat, iconSrc)
+		}
+	}
+
+	// 사라진 항목은 신규 기록에서 정리
+	for name := range seen {
+		if !present[name] {
+			delete(seen, name)
+			seenChanged = true
+		}
+	}
+	if seenChanged {
+		a.saveSeen(seen)
+	}
+
 	for ci := range cats {
 		sort.Slice(cats[ci], func(i, j int) bool {
 			return strings.ToLower(cats[ci][i].label) < strings.ToLower(cats[ci][j].label)
@@ -421,15 +585,68 @@ func (a *app) scan() [catCount][]item {
 	return cats
 }
 
-// classify 는 항목의 카테고리(열)와 아이콘 소스 경로를 정한다.
-//   - 실제 폴더            → 폴더
-//   - .url  http/https     → 웹
-//   - .url  file://폴더    → 폴더, file://파일 → 앱
-//   - .lnk  대상이 폴더    → 폴더, 그 외 → 앱
-//   - 기타 파일            → 앱
-func classify(full string, isDir bool) (int, string) {
+func skipName(name string) bool {
+	return strings.HasPrefix(name, ".") || strings.EqualFold(name, "desktop.ini")
+}
+
+func isCatFolder(name string) bool {
+	for _, n := range catFolderNames {
+		if name == n {
+			return true
+		}
+	}
+	return false
+}
+
+// ---- 신규(!) 기록: shortcuts\.seen 에 "파일이름<TAB>처음본시각" 저장 ----
+
+func (a *app) seenPath() string {
+	return filepath.Join(a.dataDir, ".seen")
+}
+
+func (a *app) loadSeen() (map[string]int64, bool) {
+	m := map[string]int64{}
+	data, err := os.ReadFile(a.seenPath())
+	if err != nil {
+		return m, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimRight(line, "\r")
+		i := strings.LastIndexByte(line, '\t')
+		if i <= 0 {
+			continue
+		}
+		ts, err := strconv.ParseInt(line[i+1:], 10, 64)
+		if err != nil {
+			continue
+		}
+		m[line[:i]] = ts
+	}
+	return m, false
+}
+
+func (a *app) saveSeen(m map[string]int64) {
+	var b strings.Builder
+	names := make([]string, 0, len(m))
+	for n := range m {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		fmt.Fprintf(&b, "%s\t%d\n", n, m[n])
+	}
+	os.WriteFile(a.seenPath(), []byte(b.String()), 0o644)
+}
+
+// ---- 자동 분류 ----
+
+// classifyAuto 는 항목의 카테고리(열)와 아이콘 소스 경로를 정한다.
+//   - .url  http/https      → 웹
+//   - 그 외(폴더/앱/파일)   → 이름·대상 경로에 개발 키워드가 있으면 개발, 없으면 비개발
+//   - 다람쥐는 수동 이동 전용
+func classifyAuto(full string, isDir bool) (int, string) {
 	if isDir {
-		return catFolder, full
+		return textCat(full), full
 	}
 	switch strings.ToLower(filepath.Ext(full)) {
 	case ".url":
@@ -437,26 +654,28 @@ func classify(full string, isDir bool) (int, string) {
 		lower := strings.ToLower(target)
 		if strings.HasPrefix(lower, "file:") {
 			if local := fileURLToPath(target); local != "" {
-				if st, err := os.Stat(local); err == nil {
-					if st.IsDir() {
-						return catFolder, local
-					}
-					return catApp, local
+				if _, err := os.Stat(local); err == nil {
+					return textCat(full + " " + local), local
 				}
 			}
-			return catApp, full
+			return textCat(full), full
 		}
 		return catWeb, full
 	case ".lnk":
-		if t := lnkTarget(full); t != "" {
-			if st, err := os.Stat(t); err == nil && st.IsDir() {
-				return catFolder, full
-			}
-		}
-		return catApp, full
+		return textCat(full + " " + lnkTarget(full)), full
 	default:
-		return catApp, full
+		return textCat(full), full
 	}
+}
+
+func textCat(s string) int {
+	s = strings.ToLower(s)
+	for _, k := range devKeywords {
+		if strings.Contains(s, k) {
+			return catDev
+		}
+	}
+	return catEtc
 }
 
 // urlTarget 은 .url(인터넷 바로가기) 파일에서 URL= 값을 읽는다.
@@ -484,6 +703,84 @@ func fileURLToPath(raw string) string {
 	}
 	return filepath.FromSlash(strings.TrimPrefix(u.Path, "/"))
 }
+
+// ---- 업데이트 확인 ----
+
+func checkUpdate(ch chan<- *updateInfo) {
+	defer func() { recover() }()
+	send := func(u *updateInfo) {
+		select {
+		case ch <- u:
+		default:
+		}
+	}
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", repoOwner, repoName))
+	if err != nil {
+		send(nil)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		send(nil)
+		return
+	}
+
+	var rel struct {
+		TagName string `json:"tag_name"`
+		HTMLURL string `json:"html_url"`
+		Assets  []struct {
+			Name string `json:"name"`
+			URL  string `json:"browser_download_url"`
+		} `json:"assets"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&rel) != nil || rel.TagName == "" {
+		send(nil)
+		return
+	}
+	if !newerVersion(rel.TagName, version) {
+		send(nil)
+		return
+	}
+	url := rel.HTMLURL
+	for _, as := range rel.Assets {
+		if strings.EqualFold(as.Name, "gotool.exe") {
+			url = as.URL
+		}
+	}
+	send(&updateInfo{tag: rel.TagName, url: url})
+}
+
+// newerVersion 은 a("v1.2.3")가 b보다 새 버전이면 true.
+func newerVersion(a, b string) bool {
+	av, bv := verNums(a), verNums(b)
+	for i := 0; i < 3; i++ {
+		if av[i] != bv[i] {
+			return av[i] > bv[i]
+		}
+	}
+	return false
+}
+
+func verNums(v string) [3]int {
+	var out [3]int
+	v = strings.TrimLeft(strings.TrimSpace(v), "vV")
+	for i, part := range strings.SplitN(v, ".", 3) {
+		digits := part
+		for j, c := range part {
+			if c < '0' || c > '9' {
+				digits = part[:j]
+				break
+			}
+		}
+		n, _ := strconv.Atoi(digits)
+		out[i] = n
+	}
+	return out
+}
+
+// ---- 메뉴 항목 삽입 ----
 
 func (a *app) insertHeader(menu windows.Handle, pos *uint32, text string, columnBreak bool) {
 	mii := menuItemInfo{
@@ -602,8 +899,7 @@ func (a *app) bitmapFromIcon(icon windows.Handle) windows.Handle {
 // .lnk/.url 은 그대로 복사하고, 그 외 파일/폴더는 .lnk 바로가기를 만든다.
 func addItem(src string) {
 	src = strings.Trim(src, `"`)
-	abs, err := filepath.Abs(src)
-	if err == nil {
+	if abs, err := filepath.Abs(src); err == nil {
 		src = abs
 	}
 	st, err := os.Stat(src)
@@ -639,9 +935,9 @@ func addItem(src string) {
 		}
 	}
 
-	cat, _ := classify(dest, false)
+	cat, _ := classifyAuto(dest, false)
 	label := strings.TrimSuffix(filepath.Base(dest), filepath.Ext(dest))
-	alert("gotool", fmt.Sprintf("추가되었습니다: %s\n분류: %s", label, catNames[cat]), mbIconInformation)
+	alert("gotool", fmt.Sprintf("추가되었습니다: %s\n분류: %s\n\n(메뉴에서 항목을 우클릭하면 다른 열로 옮길 수 있습니다)", label, catNames[cat]), mbIconInformation)
 }
 
 func uniqueDest(dir, name string) string {
@@ -818,7 +1114,7 @@ func createHiddenWindow(a *app) windows.Handle {
 
 	wndProc := windows.NewCallback(func(hwnd, msg, wparam, lparam uintptr) uintptr {
 		if msg == wmMenuRButtonUp {
-			// wparam=항목 위치, lparam=HMENU. 삭제 가능한 항목이면 메뉴를 닫고 삭제 흐름으로.
+			// wparam=항목 위치, lparam=HMENU. 이동/삭제 가능한 항목이면 메뉴를 닫고 처리 흐름으로.
 			idr, _, _ := procGetMenuItemID.Call(lparam, wparam)
 			if path, ok := a.files[uint32(idr)]; ok {
 				a.rbPath = path
