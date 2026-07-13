@@ -105,6 +105,7 @@ var (
 	procReleaseCapture      = user32.NewProc("ReleaseCapture")
 	procSetCursor           = user32.NewProc("SetCursor")
 	procLoadCursorW         = user32.NewProc("LoadCursorW")
+	procLoadIconW           = user32.NewProc("LoadIconW")
 	procGetMessageW         = user32.NewProc("GetMessageW")
 	procTranslateMessage    = user32.NewProc("TranslateMessage")
 	procDispatchMessageW    = user32.NewProc("DispatchMessageW")
@@ -661,11 +662,15 @@ func (a *app) createWindow() bool {
 	className := utf16Ptr("gotoolPanelWnd")
 	arrow, _, _ := procLoadCursorW.Call(0, idcArrow)
 
+	appIcon, _, _ := procLoadIconW.Call(hInst, 1) // rsrc 로 임베드한 앱 아이콘
+
 	wndProc := windows.NewCallback(a.wndProc)
 	wc := wndClassEx{
 		cbSize:        uint32(unsafe.Sizeof(wndClassEx{})),
 		lpfnWndProc:   wndProc,
 		hInstance:     windows.Handle(hInst),
+		hIcon:         windows.Handle(appIcon),
+		hIconSm:       windows.Handle(appIcon),
 		hCursor:       windows.Handle(arrow),
 		lpszClassName: className,
 	}
@@ -1336,11 +1341,14 @@ func (s *settingsUI) create() bool {
 
 	if !a.setClsReg {
 		arrow, _, _ := procLoadCursorW.Call(0, idcArrow)
+		appIcon, _, _ := procLoadIconW.Call(hInst, 1)
 		wndProc := windows.NewCallback(a.settingsProc)
 		wc := wndClassEx{
 			cbSize:        uint32(unsafe.Sizeof(wndClassEx{})),
 			lpfnWndProc:   wndProc,
 			hInstance:     windows.Handle(hInst),
+			hIcon:         windows.Handle(appIcon),
+			hIconSm:       windows.Handle(appIcon),
 			hCursor:       windows.Handle(arrow),
 			hbrBackground: windows.Handle(colorMenu + 1),
 			lpszClassName: className,
