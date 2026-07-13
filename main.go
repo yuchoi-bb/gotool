@@ -28,6 +28,8 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -40,6 +42,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -118,6 +122,7 @@ var (
 	procSetProcessDPIAware  = user32.NewProc("SetProcessDPIAware")
 	procDrawIconEx          = user32.NewProc("DrawIconEx")
 	procDestroyIcon         = user32.NewProc("DestroyIcon")
+	procCreateIconIndirect  = user32.NewProc("CreateIconIndirect")
 	procGetDC               = user32.NewProc("GetDC")
 	procReleaseDC           = user32.NewProc("ReleaseDC")
 	procMonitorFromPoint    = user32.NewProc("MonitorFromPoint")
@@ -142,6 +147,9 @@ var (
 	procCreateFontW            = gdi32.NewProc("CreateFontW")
 	procGetTextExtentPoint32W  = gdi32.NewProc("GetTextExtentPoint32W")
 	procGetDeviceCaps          = gdi32.NewProc("GetDeviceCaps")
+	procCreateDIBSection       = gdi32.NewProc("CreateDIBSection")
+	procCreateBitmap           = gdi32.NewProc("CreateBitmap")
+	procGdiFlush               = gdi32.NewProc("GdiFlush")
 
 	procSHGetFileInfoW = shell32.NewProc("SHGetFileInfoW")
 	procShellExecuteW  = shell32.NewProc("ShellExecuteW")
@@ -196,6 +204,7 @@ const (
 	wmRButtonUp   = 0x0205
 	wmAppUpdate   = 0x8000 + 1 // 업데이트 확인 완료(고루틴 → UI 스레드)
 	wmAppUpdated  = 0x8000 + 2 // 자동 업데이트(다운로드/교체) 완료
+	wmAppIcon     = 0x8000 + 3 // 백그라운드 아이콘 추출 결과 도착
 
 	waInactive = 0
 	vkEscape   = 0x1B
@@ -383,6 +392,33 @@ type monitorInfo struct {
 	dwFlags   uint32
 }
 
+type bitmapInfoHeader struct {
+	biSize          uint32
+	biWidth         int32
+	biHeight        int32
+	biPlanes        uint16
+	biBitCount      uint16
+	biCompression   uint32
+	biSizeImage     uint32
+	biXPelsPerMeter int32
+	biYPelsPerMeter int32
+	biClrUsed       uint32
+	biClrImportant  uint32
+}
+
+type bitmapInfo struct {
+	header bitmapInfoHeader
+	colors [1]uint32
+}
+
+type iconInfoStruct struct {
+	fIcon    int32
+	xHotspot uint32
+	yHotspot uint32
+	hbmMask  windows.Handle
+	hbmColor windows.Handle
+}
+
 // monitorWorkFromPoint 는 해당 좌표가 속한 모니터의 작업 영역을 돌려준다.
 // 창이 모니터 경계를 넘어 옆 모니터로 걸치지 않게 하는 데 쓴다.
 func monitorWorkFromPoint(pt point) rect {
@@ -515,6 +551,33 @@ type app struct {
 	settings   *settingsUI // 열려 있는 설정 창(없으면 nil)
 	setClsReg  bool
 	panelAlive bool
+
+	// 아이콘 비동기 로딩/캐시: 패널을 먼저 띄우고 아이콘은 뒤에서 채운다.
+	gen       int64 // reload 세대(이전 워커 결과 무시용, atomic)
+	iconCh    chan iconResult
+	cacheMu   sync.Mutex
+	iconCache map[string]cacheEnt
+}
+
+type iconResult struct {
+	gen  int64
+	cat  int
+	idx  int
+	icon windows.Handle
+}
+
+type iconJob struct {
+	cat   int
+	idx   int
+	src   string
+	key   string
+	mtime int64
+}
+
+type cacheEnt struct {
+	mtime int64
+	w, h  int32
+	pix   []byte // RGBA
 }
 
 func main() {
@@ -599,11 +662,13 @@ func runPanel(dir string) {
 		iconCy:   getSystemMetrics(smCySmIcon, 16),
 		updateCh: make(chan *updateInfo, 1),
 		updErrCh: make(chan error, 1),
+		iconCh:   make(chan iconResult, 1024),
 		hover:    hit{kind: hitNone},
 		pressed:  hit{kind: hitNone},
 		dropCat:  -1,
 		dropIdx:  -1,
 	}
+	a.iconCache = loadIconCache(a.iconCachePath())
 
 	hdcScreen, _, _ := procGetDC.Call(0)
 	dpi, _, _ := procGetDeviceCaps.Call(hdcScreen, logPixelsY)
@@ -740,6 +805,9 @@ func (a *app) wndProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 		default:
 		}
 		return 0
+	case wmAppIcon:
+		a.drainIcons()
+		return 0
 	case wmAppUpdated:
 		var err error
 		select {
@@ -792,20 +860,111 @@ func (a *app) reload() {
 		a.devKeys = defaultDevKeywords
 	}
 
+	// 패널을 빨리 띄우기 위해 아이콘은 여기서 추출하지 않는다:
+	// 캐시에 있으면 즉시 복원, 없으면 백그라운드 워커가 추출해서 채운다.
+	gen := atomic.AddInt64(&a.gen, 1)
+	var jobs []iconJob
+	var live []string
+
 	cats := a.scan()
 	a.items = make([][]uiItem, len(a.cols))
 	for ci := range a.cols {
 		for _, it := range cats[ci] {
+			key := filepath.ToSlash(it.rel) + "|" + strconv.Itoa(int(a.iconCx))
+			live = append(live, key)
+			var icon windows.Handle
+			a.cacheMu.Lock()
+			if ce, ok := a.iconCache[key]; ok && ce.mtime == it.mtime {
+				icon = iconFromRGBA(ce.w, ce.h, ce.pix)
+			}
+			a.cacheMu.Unlock()
+			if icon == 0 {
+				jobs = append(jobs, iconJob{cat: ci, idx: len(a.items[ci]), src: it.iconSrc, key: key, mtime: it.mtime})
+			}
 			a.items[ci] = append(a.items[ci], uiItem{
 				label: it.label,
 				path:  it.path,
 				rel:   it.rel,
-				icon:  iconHandle(it.iconSrc),
+				icon:  icon,
 			})
 		}
 	}
 	a.saveOrderFromItems()
 	a.layout()
+
+	if len(jobs) > 0 {
+		go a.iconWorker(gen, jobs, live)
+	}
+}
+
+// iconWorker 는 백그라운드에서 셸 아이콘을 추출해 UI 스레드로 보내고,
+// 추출한 픽셀을 디스크 캐시(.iconcache)에 저장해 다음 실행부터 즉시 표시되게 한다.
+func (a *app) iconWorker(gen int64, jobs []iconJob, live []string) {
+	defer func() { recover() }()
+	runtime.LockOSThread()
+	procCoInitializeEx.Call(0, coinitApartment)
+	defer procCoUninitialize.Call()
+
+	fresh := map[string]cacheEnt{}
+	for _, j := range jobs {
+		if atomic.LoadInt64(&a.gen) != gen {
+			return // 그 사이 새로고침됨 → 중단
+		}
+		icon := iconHandle(j.src)
+		if icon != 0 {
+			if pix := hiconToRGBA(icon, a.iconCx, a.iconCy); pix != nil {
+				fresh[j.key] = cacheEnt{mtime: j.mtime, w: a.iconCx, h: a.iconCy, pix: pix}
+			}
+		}
+		select {
+		case a.iconCh <- iconResult{gen: gen, cat: j.cat, idx: j.idx, icon: icon}:
+			procPostMessageW.Call(uintptr(a.hwnd), wmAppIcon, 0, 0)
+		default:
+			if icon != 0 {
+				procDestroyIcon.Call(uintptr(icon))
+			}
+		}
+	}
+
+	// 캐시 병합: 새 항목 반영 + 사라진 항목 정리 후 저장
+	liveSet := map[string]bool{}
+	for _, k := range live {
+		liveSet[k] = true
+	}
+	a.cacheMu.Lock()
+	for k, v := range fresh {
+		a.iconCache[k] = v
+	}
+	for k := range a.iconCache {
+		if !liveSet[k] {
+			delete(a.iconCache, k)
+		}
+	}
+	saveIconCache(a.iconCachePath(), a.iconCache)
+	a.cacheMu.Unlock()
+}
+
+// drainIcons 는 워커가 보낸 아이콘을 항목에 반영한다(세대가 다르면 폐기).
+func (a *app) drainIcons() {
+	changed := false
+	for {
+		select {
+		case r := <-a.iconCh:
+			if r.gen == atomic.LoadInt64(&a.gen) &&
+				r.cat < len(a.items) && r.idx < len(a.items[r.cat]) &&
+				a.items[r.cat][r.idx].icon == 0 {
+				a.items[r.cat][r.idx].icon = r.icon
+				changed = true
+			} else if r.icon != 0 {
+				procDestroyIcon.Call(uintptr(r.icon))
+			}
+		default:
+			if changed {
+				procInvalidateRect.Call(uintptr(a.hwnd), 0, 0)
+			}
+			return
+		}
+	}
 }
 
 func (a *app) freeIcons() {
@@ -1768,6 +1927,7 @@ type item struct {
 	rel     string
 	iconSrc string
 	ord     int
+	mtime   int64
 }
 
 // scan 은 데이터 폴더의 항목을 읽어 열별로 나눈다.
@@ -1782,10 +1942,14 @@ func (a *app) scan() [][]item {
 	now := time.Now().Unix()
 	present := map[string]bool{}
 
-	appendItem := func(full string, isDir bool, ci int, iconSrc string) {
+	appendItem := func(e fs.DirEntry, full string, isDir bool, ci int, iconSrc string) {
 		rel, err := filepath.Rel(a.dataDir, full)
 		if err != nil {
 			rel = filepath.Base(full)
+		}
+		var mtime int64
+		if fi, err := e.Info(); err == nil {
+			mtime = fi.ModTime().Unix()
 		}
 		base := filepath.Base(full)
 		present[base] = true
@@ -1806,7 +1970,7 @@ func (a *app) scan() [][]item {
 		if !ok {
 			ord = 1 << 30
 		}
-		cats[ci] = append(cats[ci], item{label: label, path: full, rel: rel, iconSrc: iconSrc, ord: ord})
+		cats[ci] = append(cats[ci], item{label: label, path: full, rel: rel, iconSrc: iconSrc, ord: ord, mtime: mtime})
 	}
 
 	// 열 강제 폴더
@@ -1823,7 +1987,7 @@ func (a *app) scan() [][]item {
 			}
 			full := filepath.Join(dir, e.Name())
 			_, iconSrc := a.classifyAuto(full, e.IsDir())
-			appendItem(full, e.IsDir(), ci, iconSrc)
+			appendItem(e, full, e.IsDir(), ci, iconSrc)
 		}
 	}
 
@@ -1840,7 +2004,7 @@ func (a *app) scan() [][]item {
 			}
 			full := filepath.Join(a.dataDir, name)
 			kind, iconSrc := a.classifyAuto(full, e.IsDir())
-			appendItem(full, e.IsDir(), a.autoCol(kind), iconSrc)
+			appendItem(e, full, e.IsDir(), a.autoCol(kind), iconSrc)
 		}
 	}
 
@@ -2168,6 +2332,161 @@ func verNums(v string) [3]int {
 }
 
 // ---- 아이콘/폰트 ----
+
+// ---- 아이콘 캐시(.iconcache): RGBA 픽셀을 저장해 다음 실행부터 즉시 표시 ----
+
+const iconCacheMagic = "GICO1"
+
+func (a *app) iconCachePath() string {
+	return filepath.Join(a.dataDir, ".iconcache")
+}
+
+func loadIconCache(path string) map[string]cacheEnt {
+	m := map[string]cacheEnt{}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) < 5 || string(data[:5]) != iconCacheMagic {
+		return m
+	}
+	r := bytes.NewReader(data[5:])
+	for {
+		var keyLen uint16
+		if binary.Read(r, binary.LittleEndian, &keyLen) != nil {
+			break
+		}
+		key := make([]byte, keyLen)
+		if _, err := io.ReadFull(r, key); err != nil {
+			break
+		}
+		var ent struct {
+			Mtime  int64
+			W, H   int32
+			PixLen uint32
+		}
+		if binary.Read(r, binary.LittleEndian, &ent) != nil {
+			break
+		}
+		if ent.PixLen > 16*1024*1024 || int64(ent.W)*int64(ent.H)*4 != int64(ent.PixLen) {
+			break
+		}
+		pix := make([]byte, ent.PixLen)
+		if _, err := io.ReadFull(r, pix); err != nil {
+			break
+		}
+		m[string(key)] = cacheEnt{mtime: ent.Mtime, w: ent.W, h: ent.H, pix: pix}
+	}
+	return m
+}
+
+func saveIconCache(path string, m map[string]cacheEnt) {
+	var b bytes.Buffer
+	b.WriteString(iconCacheMagic)
+	for key, ent := range m {
+		binary.Write(&b, binary.LittleEndian, uint16(len(key)))
+		b.WriteString(key)
+		binary.Write(&b, binary.LittleEndian, struct {
+			Mtime  int64
+			W, H   int32
+			PixLen uint32
+		}{ent.mtime, ent.w, ent.h, uint32(len(ent.pix))})
+		b.Write(ent.pix)
+	}
+	os.WriteFile(path, b.Bytes(), 0o644)
+}
+
+// hiconToRGBA 는 HICON을 RGBA 픽셀로 변환한다(캐시 저장용).
+func hiconToRGBA(icon windows.Handle, w, h int32) []byte {
+	hdc, _, _ := procGetDC.Call(0)
+	if hdc == 0 {
+		return nil
+	}
+	defer procReleaseDC.Call(0, hdc)
+	memDC, _, _ := procCreateCompatibleDC.Call(hdc)
+	if memDC == 0 {
+		return nil
+	}
+	defer procDeleteDC.Call(memDC)
+
+	bi := bitmapInfo{header: bitmapInfoHeader{
+		biSize:     uint32(unsafe.Sizeof(bitmapInfoHeader{})),
+		biWidth:    w,
+		biHeight:   -h, // top-down
+		biPlanes:   1,
+		biBitCount: 32,
+	}}
+	var bits unsafe.Pointer
+	hbmp, _, _ := procCreateDIBSection.Call(hdc, uintptr(unsafe.Pointer(&bi)), 0, uintptr(unsafe.Pointer(&bits)), 0, 0)
+	if hbmp == 0 || bits == nil {
+		return nil
+	}
+	defer procDeleteObject.Call(hbmp)
+
+	old, _, _ := procSelectObject.Call(memDC, hbmp)
+	procDrawIconEx.Call(memDC, 0, 0, uintptr(icon), uintptr(w), uintptr(h), 0, 0, diNormal)
+	procGdiFlush.Call()
+	procSelectObject.Call(memDC, old)
+
+	n := int(w * h * 4)
+	src := unsafe.Slice((*byte)(bits), n)
+	out := make([]byte, n)
+	opaque := false
+	for i := 0; i < n; i += 4 {
+		out[i] = src[i+2] // R
+		out[i+1] = src[i+1]
+		out[i+2] = src[i] // B
+		out[i+3] = src[i+3]
+		if src[i+3] != 0 {
+			opaque = true
+		}
+	}
+	if !opaque {
+		// 알파 채널이 없는 옛날 아이콘: 색이 있는 픽셀을 불투명 처리
+		for i := 0; i < n; i += 4 {
+			if out[i] != 0 || out[i+1] != 0 || out[i+2] != 0 {
+				out[i+3] = 255
+			}
+		}
+	}
+	return out
+}
+
+// iconFromRGBA 는 캐시된 RGBA 픽셀로 HICON을 만든다.
+func iconFromRGBA(w, h int32, pix []byte) windows.Handle {
+	if int64(w)*int64(h)*4 != int64(len(pix)) || w <= 0 || h <= 0 {
+		return 0
+	}
+	bi := bitmapInfo{header: bitmapInfoHeader{
+		biSize:     uint32(unsafe.Sizeof(bitmapInfoHeader{})),
+		biWidth:    w,
+		biHeight:   -h,
+		biPlanes:   1,
+		biBitCount: 32,
+	}}
+	var bits unsafe.Pointer
+	hbmColor, _, _ := procCreateDIBSection.Call(0, uintptr(unsafe.Pointer(&bi)), 0, uintptr(unsafe.Pointer(&bits)), 0, 0)
+	if hbmColor == 0 || bits == nil {
+		return 0
+	}
+	defer procDeleteObject.Call(hbmColor)
+
+	n := len(pix)
+	dst := unsafe.Slice((*byte)(bits), n)
+	for i := 0; i < n; i += 4 {
+		dst[i] = pix[i+2] // B
+		dst[i+1] = pix[i+1]
+		dst[i+2] = pix[i] // R
+		dst[i+3] = pix[i+3]
+	}
+
+	hbmMask, _, _ := procCreateBitmap.Call(uintptr(w), uintptr(h), 1, 1, 0)
+	if hbmMask == 0 {
+		return 0
+	}
+	defer procDeleteObject.Call(hbmMask)
+
+	ii := iconInfoStruct{fIcon: 1, hbmMask: windows.Handle(hbmMask), hbmColor: windows.Handle(hbmColor)}
+	icon, _, _ := procCreateIconIndirect.Call(uintptr(unsafe.Pointer(&ii)))
+	return windows.Handle(icon)
+}
 
 // iconHandle 은 경로의 셸 아이콘(HICON)을 얻는다. 쓰고 나면 DestroyIcon 필요.
 func iconHandle(path string) windows.Handle {
