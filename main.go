@@ -1,15 +1,25 @@
 //go:build windows
 
 // gotool — 즐겨찾기(바로가기) 런처.
-// 실행하면 마우스 커서 위치에 우클릭 메뉴 모양의 4열 패널(웹 | 개발 | 비개발 | 다람쥐)이 뜬다.
+// 실행하면 마우스 커서 위치에 우클릭 메뉴 모양의 다열 패널이 뜬다.
 //   - 왼쪽 클릭: 실행(창 닫힘)
-//   - 드래그 & 드롭: 항목을 다른 열로 이동(창은 닫히지 않고 제자리 유지)
+//   - 드래그 & 드롭: 다른 열로 이동하거나 같은 열 안에서 순서 변경(창은 제자리 유지)
 //   - 오른쪽 클릭: 삭제(확인창)
 //   - ESC 또는 바깥 클릭: 닫기
 //
+// 데이터는 모두 exe 옆 shortcuts 폴더에 저장된다:
+//   - 바로가기 파일(.lnk/.url)과 카테고리 하위 폴더
+//   - config.json  열 구성(이름/폴더/자동분류)
+//   - .order       표시 순서
+//   - .seen        신규(!) 표시 기록
+//
+// 백업(zip 내보내기)/복원 버튼으로 포맷 후에도 그대로 복구할 수 있다.
+//
+// 오류는 exe 옆 gotool.log 에 "시각 <TAB> 버전 <TAB> 코드 <TAB> 내용" 형식으로 기록된다.
+//
 // 사용법:
 //
-//	gotool.exe              exe 옆 shortcuts 폴더의 내용을 4열 패널로 표시
+//	gotool.exe              exe 옆 shortcuts 폴더의 내용을 패널로 표시
 //	gotool.exe <폴더>       지정한 폴더의 내용을 표시
 //	gotool.exe add <경로>   파일/폴더를 shortcuts 폴더에 추가 (.lnk/.url은 복사, 그 외는 바로가기 생성)
 //	gotool.exe install      탐색기 우클릭 메뉴에 "gotool에 추가" 등록
@@ -17,8 +27,11 @@
 package main
 
 import (
+	"archive/zip"
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/fs"
 	"net/http"
 	neturl "net/url"
 	"os"
@@ -35,7 +48,7 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
-// 릴리스 빌드 시 ldflags 로 주입된다: -X main.version=v0.4.0
+// 릴리스 빌드 시 ldflags 로 주입된다: -X main.version=v0.5.0
 var version = "v0.0.0"
 
 const (
@@ -45,17 +58,32 @@ const (
 	newBadgeAge = 10 * time.Minute // 추가된 지 이 시간 안이면 이름 오른쪽에 "!" 표시
 )
 
+// 오류 코드(gotool.log 와 오류창에 함께 표시)
+const (
+	errFolder   = "E01" // 폴더 생성/접근 실패
+	errWindow   = "E02" // 창 생성 실패
+	errMove     = "E03" // 항목 이동 실패
+	errDelete   = "E04" // 항목 삭제 실패
+	errAdd      = "E05" // 항목 추가 실패
+	errRegistry = "E06" // 우클릭 메뉴 등록/해제 실패
+	errUpdate   = "E07" // 업데이트 확인 실패(알림 없이 기록만)
+	errBackup   = "E08" // 백업/복원 실패
+	errConfig   = "E09" // 설정 파일(config.json) 오류
+	errPanic    = "E99" // 예기치 못한 오류(패닉)
+)
+
 // Win32 창은 만든 스레드에서만 다룰 수 있으므로 main 고루틴을 OS 스레드에 고정한다.
 func init() {
 	runtime.LockOSThread()
 }
 
 var (
-	user32  = windows.NewLazySystemDLL("user32.dll")
-	gdi32   = windows.NewLazySystemDLL("gdi32.dll")
-	shell32 = windows.NewLazySystemDLL("shell32.dll")
-	ole32   = windows.NewLazySystemDLL("ole32.dll")
-	kernel  = windows.NewLazySystemDLL("kernel32.dll")
+	user32   = windows.NewLazySystemDLL("user32.dll")
+	gdi32    = windows.NewLazySystemDLL("gdi32.dll")
+	shell32  = windows.NewLazySystemDLL("shell32.dll")
+	ole32    = windows.NewLazySystemDLL("ole32.dll")
+	kernel   = windows.NewLazySystemDLL("kernel32.dll")
+	comdlg32 = windows.NewLazySystemDLL("comdlg32.dll")
 
 	procRegisterClassExW    = user32.NewProc("RegisterClassExW")
 	procCreateWindowExW     = user32.NewProc("CreateWindowExW")
@@ -111,6 +139,9 @@ var (
 	procCoCreateInstance = ole32.NewProc("CoCreateInstance")
 
 	procGetModuleHandleW = kernel.NewProc("GetModuleHandleW")
+
+	procGetSaveFileNameW = comdlg32.NewProc("GetSaveFileNameW")
+	procGetOpenFileNameW = comdlg32.NewProc("GetOpenFileNameW")
 )
 
 const (
@@ -151,7 +182,6 @@ const (
 	colorHighlightText = 14
 	color3DShadow      = 16
 	colorGrayText      = 17
-	colorHotlight      = 26
 
 	srcCopy       = 0x00CC0020
 	bkTransparent = 1
@@ -180,30 +210,93 @@ const (
 
 	clsctxInprocServer = 1
 	coinitApartment    = 2
+
+	ofnOverwritePrompt = 0x00000002
+	ofnFileMustExist   = 0x00001000
 )
 
-// 카테고리(=열)
-const (
-	catWeb = iota
-	catDev
-	catEtc
-	catSquirrel
-	catCount
-)
+// ---- 설정(config.json): 열 구성 ----
 
-var catNames = [catCount]string{"🌐 웹", "💻 개발", "📦 비개발", "🐿 다람쥐"}
+type column struct {
+	Name   string `json:"name"`           // 열 제목(패널에 표시)
+	Folder string `json:"folder"`         // shortcuts 안의 하위 폴더 이름
+	Auto   string `json:"auto,omitempty"` // 자동 분류 대상: "web" | "dev" | "etc" | ""(수동 전용)
+}
 
-// shortcuts 폴더 안에서 카테고리를 강제하는 하위 폴더 이름.
-var catFolderNames = [catCount]string{"웹", "개발", "비개발", "다람쥐"}
+type appConfig struct {
+	Columns     []column `json:"columns"`
+	DevKeywords []string `json:"devKeywords,omitempty"` // "dev" 자동 분류 키워드(비우면 기본값)
+}
 
-// 자동 분류에서 "개발"로 판정할 키워드(바로가기 이름/대상 경로에 포함되면 개발)
-var devKeywords = []string{
+func defaultConfig() appConfig {
+	return appConfig{
+		Columns: []column{
+			{Name: "🌐 웹", Folder: "웹", Auto: "web"},
+			{Name: "💻 개발", Folder: "개발", Auto: "dev"},
+			{Name: "📦 비개발", Folder: "비개발", Auto: "etc"},
+			{Name: "🐿 다람쥐", Folder: "다람쥐"},
+		},
+	}
+}
+
+var defaultDevKeywords = []string{
 	"code", "studio", "git", "docker", "python", "pycharm", "intellij", "idea",
 	"webstorm", "goland", "clion", "rider", "devenv", "node", "npm", "sql",
 	"vim", "sublime", "eclipse", "unity", "unreal", "android", "sdk",
 	"terminal", "cmd", "powershell", "putty", "ssh", "postman", "notepad++",
 	"dbeaver", "cursor", "wsl", "개발",
 }
+
+func configPath(dataDir string) string {
+	return filepath.Join(dataDir, "config.json")
+}
+
+// loadConfig 는 config.json 을 읽는다. 없으면 기본값으로 만들어 저장한다.
+func loadConfig(dataDir string) appConfig {
+	p := configPath(dataDir)
+	data, err := os.ReadFile(p)
+	if err != nil {
+		cfg := defaultConfig()
+		saveConfig(dataDir, cfg)
+		return cfg
+	}
+	var cfg appConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		alertErr(errConfig, "설정 파일(config.json)을 읽을 수 없어 기본 구성으로 실행합니다", err)
+		return defaultConfig()
+	}
+	// 잘못된 항목 정리
+	var cols []column
+	for _, c := range cfg.Columns {
+		c.Name = strings.TrimSpace(c.Name)
+		c.Folder = strings.TrimSpace(c.Folder)
+		if c.Folder == "" || strings.ContainsAny(c.Folder, `\/:*?"<>|`) {
+			continue
+		}
+		if c.Name == "" {
+			c.Name = c.Folder
+		}
+		cols = append(cols, c)
+	}
+	if len(cols) == 0 {
+		alertErr(errConfig, "설정 파일에 유효한 열이 없어 기본 구성으로 실행합니다", nil)
+		return defaultConfig()
+	}
+	cfg.Columns = cols
+	return cfg
+}
+
+func saveConfig(dataDir string, cfg appConfig) {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(configPath(dataDir), data, 0o644); err != nil {
+		logErr(errConfig, "config.json 저장 실패: "+err.Error())
+	}
+}
+
+// ---- 구조체 ----
 
 type point struct{ x, y int32 }
 type gdiSize struct{ cx, cy int32 }
@@ -254,10 +347,40 @@ type shFileInfo struct {
 	szTypeName    [80]uint16
 }
 
+type openFileNameW struct {
+	lStructSize       uint32
+	_                 uint32
+	hwndOwner         windows.Handle
+	hInstance         windows.Handle
+	lpstrFilter       *uint16
+	lpstrCustomFilter *uint16
+	nMaxCustFilter    uint32
+	nFilterIndex      uint32
+	lpstrFile         *uint16
+	nMaxFile          uint32
+	_                 uint32
+	lpstrFileTitle    *uint16
+	nMaxFileTitle     uint32
+	_                 uint32
+	lpstrInitialDir   *uint16
+	lpstrTitle        *uint16
+	flags             uint32
+	nFileOffset       uint16
+	nFileExtension    uint16
+	lpstrDefExt       *uint16
+	lCustData         uintptr
+	lpfnHook          uintptr
+	lpTemplateName    *uint16
+	pvReserved        uintptr
+	dwReserved        uint32
+	flagsEx           uint32
+}
+
 type uiItem struct {
 	label string
-	path  string
-	icon  windows.Handle // HICON (없으면 0)
+	path  string // ShellExecute 대상(바로가기 파일 자체)
+	rel   string // dataDir 기준 상대 경로(순서 저장용)
+	icon  windows.Handle
 	rc    rect
 }
 
@@ -271,7 +394,10 @@ const (
 	hitNone = iota
 	hitItem
 	hitUpdate
+	hitSettings
 	hitOpen
+	hitBackup
+	hitRestore
 	hitInstall
 )
 
@@ -281,21 +407,27 @@ type hit struct {
 	idx  int
 }
 
+type button struct {
+	kind  int
+	label string
+	rc    rect
+}
+
 type app struct {
 	dataDir string
+	cols    []column
+	devKeys []string
 	hwnd    windows.Handle
 	font    windows.Handle
 	iconCx  int32
 	iconCy  int32
 	dpi     int32
 
-	items    [catCount][]uiItem
-	colBand  [catCount]rect // 드롭 대상 영역(헤더 포함 열 전체)
-	headerRc [catCount]rect
+	items    [][]uiItem
+	colBand  []rect
+	headerRc []rect
+	buttons  []button
 	updRc    rect
-	openRc   rect
-	instRc   rect
-	showInst bool
 	winW     int32
 	winH     int32
 
@@ -304,18 +436,19 @@ type app struct {
 	pressPt  point
 	dragging bool
 	dropCat  int
+	dropIdx  int
 
-	modal bool // MessageBox 표시 중(비활성화로 창이 닫히지 않게)
+	modal bool // 대화상자 표시 중(비활성화로 창이 닫히지 않게)
 
 	update   *updateInfo
 	updateCh chan *updateInfo
 }
 
 func main() {
-	// windowsgui 빌드는 콘솔이 없어 패닉이 보이지 않으므로 메시지박스로 알린다.
+	// windowsgui 빌드는 콘솔이 없어 패닉이 보이지 않으므로 기록하고 메시지박스로 알린다.
 	defer func() {
 		if r := recover(); r != nil {
-			alert("gotool", fmt.Sprintf("오류가 발생했습니다:\n%v", r), mbIconError)
+			alertErr(errPanic, fmt.Sprintf("예기치 못한 오류가 발생했습니다:\n%v", r), nil)
 		}
 	}()
 
@@ -335,14 +468,14 @@ func main() {
 			return
 		case "install":
 			if err := installContextMenu(); err != nil {
-				alert("gotool", "우클릭 메뉴 등록 실패:\n"+err.Error(), mbIconError)
+				alertErr(errRegistry, "우클릭 메뉴 등록 실패", err)
 			} else {
 				alert("gotool", "탐색기 우클릭 메뉴에 \"gotool에 추가\"를 등록했습니다.\n\nWindows 11에서는 우클릭 후 \"더 많은 옵션 표시\" 안에 나타납니다.", mbIconInformation)
 			}
 			return
 		case "uninstall":
 			if err := uninstallContextMenu(); err != nil {
-				alert("gotool", "우클릭 메뉴 해제 실패:\n"+err.Error(), mbIconError)
+				alertErr(errRegistry, "우클릭 메뉴 해제 실패", err)
 			} else {
 				alert("gotool", "우클릭 메뉴 등록을 해제했습니다.", mbIconInformation)
 			}
@@ -352,7 +485,7 @@ func main() {
 
 	dir, err := resolveDir(args)
 	if err != nil {
-		alert("gotool", err.Error(), mbIconError)
+		alertErr(errFolder, err.Error(), nil)
 		return
 	}
 	runPanel(dir)
@@ -390,6 +523,7 @@ func runPanel(dir string) {
 		hover:    hit{kind: hitNone},
 		pressed:  hit{kind: hitNone},
 		dropCat:  -1,
+		dropIdx:  -1,
 	}
 
 	hdcScreen, _, _ := procGetDC.Call(0)
@@ -403,7 +537,7 @@ func runPanel(dir string) {
 	defer procDeleteObject.Call(uintptr(a.font))
 
 	if !a.createWindow() {
-		alert("gotool", "창을 생성하지 못했습니다.", mbIconError)
+		alertErr(errWindow, "창을 생성하지 못했습니다", nil)
 		return
 	}
 
@@ -490,16 +624,20 @@ func (a *app) wndProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 	case wmEraseBkgnd:
 		return 1
 	case wmMouseMove:
-		a.onMouseMove(mouseXY(lparam))
+		x, y := mouseXY(lparam)
+		a.onMouseMove(x, y)
 		return 0
 	case wmLButtonDown:
-		a.onLButtonDown(mouseXY(lparam))
+		x, y := mouseXY(lparam)
+		a.onLButtonDown(x, y)
 		return 0
 	case wmLButtonUp:
-		a.onLButtonUp(mouseXY(lparam))
+		x, y := mouseXY(lparam)
+		a.onLButtonUp(x, y)
 		return 0
 	case wmRButtonUp:
-		a.onRButtonUp(mouseXY(lparam))
+		x, y := mouseXY(lparam)
+		a.onRButtonUp(x, y)
 		return 0
 	case wmSetCursor:
 		if a.dragging {
@@ -541,22 +679,30 @@ func mouseXY(lparam uintptr) (int32, int32) {
 
 func (a *app) scale(n int32) int32 { return n * a.dpi / 96 }
 
-// reload 는 폴더를 다시 읽고 아이콘/레이아웃을 계산한다.
+// reload 는 설정/폴더를 다시 읽고 아이콘/레이아웃을 계산한다.
 func (a *app) reload() {
 	a.freeIcons()
 
+	cfg := loadConfig(a.dataDir)
+	a.cols = cfg.Columns
+	a.devKeys = cfg.DevKeywords
+	if len(a.devKeys) == 0 {
+		a.devKeys = defaultDevKeywords
+	}
+
 	cats := a.scan()
-	for ci := 0; ci < catCount; ci++ {
-		a.items[ci] = nil
+	a.items = make([][]uiItem, len(a.cols))
+	for ci := range a.cols {
 		for _, it := range cats[ci] {
 			a.items[ci] = append(a.items[ci], uiItem{
 				label: it.label,
 				path:  it.path,
+				rel:   it.rel,
 				icon:  iconHandle(it.iconSrc),
 			})
 		}
 	}
-	a.showInst = !contextMenuInstalled()
+	a.saveOrderFromItems()
 	a.layout()
 }
 
@@ -568,6 +714,7 @@ func (a *app) freeIcons() {
 			}
 		}
 	}
+	a.items = nil
 }
 
 // layout 은 열 너비/항목 좌표/버튼 좌표와 창 크기를 계산한다.
@@ -592,10 +739,14 @@ func (a *app) layout() {
 		return sz.cx
 	}
 
-	var colW [catCount]int32
+	n := len(a.cols)
+	a.headerRc = make([]rect, n)
+	a.colBand = make([]rect, n)
+
+	colW := make([]int32, n)
 	maxRows := 1
-	for ci := 0; ci < catCount; ci++ {
-		w := textW(catNames[ci])
+	for ci := 0; ci < n; ci++ {
+		w := textW(a.cols[ci].Name)
 		for _, it := range a.items[ci] {
 			if tw := textW(it.label); tw > w {
 				w = tw
@@ -609,8 +760,8 @@ func (a *app) layout() {
 			w = maxCol
 		}
 		colW[ci] = w
-		if n := len(a.items[ci]); n > maxRows {
-			maxRows = n
+		if r := len(a.items[ci]); r > maxRows {
+			maxRows = r
 		}
 	}
 
@@ -623,7 +774,7 @@ func (a *app) layout() {
 	itemsBottom := colTop + rowH + int32(maxRows)*rowH // 헤더 + 항목들
 
 	x := pad
-	for ci := 0; ci < catCount; ci++ {
+	for ci := 0; ci < n; ci++ {
 		a.headerRc[ci] = rect{x, colTop, x + colW[ci], colTop + rowH}
 		y := colTop + rowH
 		for i := range a.items[ci] {
@@ -635,15 +786,27 @@ func (a *app) layout() {
 	}
 	winW := x - sepW + pad
 
-	// 하단 관리 영역
+	// 하단 관리 버튼
+	labels := []struct {
+		kind  int
+		label string
+	}{
+		{hitSettings, "⚙ 설정 (열 이름·구성 편집)"},
+		{hitOpen, "📁 바로가기 폴더 열기"},
+		{hitBackup, "💾 백업 저장 (zip)"},
+		{hitRestore, "📂 백업 불러오기"},
+	}
+	if !contextMenuInstalled() {
+		labels = append(labels, struct {
+			kind  int
+			label string
+		}{hitInstall, "🖱 우클릭 \"gotool에 추가\" 메뉴 등록"})
+	}
+	a.buttons = a.buttons[:0]
 	y := itemsBottom + a.scale(6)
-	a.openRc = rect{pad, y, winW - pad, y + rowH}
-	y += rowH
-	if a.showInst {
-		a.instRc = rect{pad, y, winW - pad, y + rowH}
+	for _, l := range labels {
+		a.buttons = append(a.buttons, button{kind: l.kind, label: l.label, rc: rect{pad, y, winW - pad, y + rowH}})
 		y += rowH
-	} else {
-		a.instRc = rect{}
 	}
 
 	if a.update != nil {
@@ -722,9 +885,9 @@ func (a *app) paint(hdc uintptr) {
 	}
 
 	// 열
-	for ci := 0; ci < catCount; ci++ {
+	for ci := range a.cols {
 		hr := a.headerRc[ci]
-		drawText(rect{hr.left + a.scale(8), hr.top, hr.right, hr.bottom}, catNames[ci], color(colorGrayText))
+		drawText(rect{hr.left + a.scale(8), hr.top, hr.right, hr.bottom}, a.cols[ci].Name, color(colorGrayText))
 		line := rect{hr.left, hr.bottom - a.scale(2), hr.right, hr.bottom - a.scale(1)}
 		procFillRect.Call(memDC, uintptr(unsafe.Pointer(&line)), brush(color3DShadow))
 
@@ -737,28 +900,36 @@ func (a *app) paint(hdc uintptr) {
 			graying := a.dragging && a.pressed.kind == hitItem && a.pressed.cat == ci && a.pressed.idx == i
 			rowText(it.rc, it.label, it.icon, hovered, graying)
 		}
-		// 열 구분선
-		if ci < catCount-1 {
+		if ci < len(a.cols)-1 {
 			sx := a.colBand[ci].right + a.scale(5)
 			line := rect{sx, a.colBand[ci].top, sx + a.scale(1), a.colBand[ci].bottom}
 			procFillRect.Call(memDC, uintptr(unsafe.Pointer(&line)), brush(color3DShadow))
 		}
 	}
 
-	// 드래그 중: 드롭 대상 열 강조
+	// 드래그 중: 드롭 대상 열 강조 + 삽입 위치 표시
 	if a.dragging && a.dropCat >= 0 {
 		band := a.colBand[a.dropCat]
 		procFrameRect.Call(memDC, uintptr(unsafe.Pointer(&band)), brush(colorHighlight))
 		inner := rect{band.left + 1, band.top + 1, band.right - 1, band.bottom - 1}
 		procFrameRect.Call(memDC, uintptr(unsafe.Pointer(&inner)), brush(colorHighlight))
+
+		if a.dropIdx >= 0 {
+			rowH := a.iconCy + a.scale(10)
+			ly := a.headerRc[a.dropCat].bottom + int32(a.dropIdx)*rowH
+			mark := rect{band.left + a.scale(2), ly - a.scale(1), band.right - a.scale(2), ly + a.scale(2)}
+			procFillRect.Call(memDC, uintptr(unsafe.Pointer(&mark)), brush(colorHighlight))
+		}
 	}
 
-	// 하단 관리 영역
-	line := rect{a.openRc.left, a.openRc.top - a.scale(3), a.openRc.right, a.openRc.top - a.scale(2)}
-	procFillRect.Call(memDC, uintptr(unsafe.Pointer(&line)), brush(color3DShadow))
-	rowText(a.openRc, "⚙ 바로가기 폴더 열기 (추가·수정·삭제)", 0, a.hover.kind == hitOpen, false)
-	if a.showInst {
-		rowText(a.instRc, "🖱 우클릭 \"gotool에 추가\" 메뉴 등록", 0, a.hover.kind == hitInstall, false)
+	// 하단 관리 버튼
+	if len(a.buttons) > 0 {
+		top := a.buttons[0].rc.top
+		line := rect{a.buttons[0].rc.left, top - a.scale(3), a.buttons[0].rc.right, top - a.scale(2)}
+		procFillRect.Call(memDC, uintptr(unsafe.Pointer(&line)), brush(color3DShadow))
+	}
+	for _, b := range a.buttons {
+		rowText(b.rc, b.label, 0, a.hover.kind == b.kind, false)
 	}
 
 	procBitBlt.Call(hdc, 0, 0, uintptr(w), uintptr(h), memDC, 0, 0, srcCopy)
@@ -775,13 +946,12 @@ func (a *app) hitTest(x, y int32) hit {
 	if a.update != nil && a.updRc.contains(x, y) {
 		return hit{kind: hitUpdate}
 	}
-	if a.openRc.contains(x, y) {
-		return hit{kind: hitOpen}
+	for _, b := range a.buttons {
+		if b.rc.contains(x, y) {
+			return hit{kind: b.kind}
+		}
 	}
-	if a.showInst && a.instRc.contains(x, y) {
-		return hit{kind: hitInstall}
-	}
-	for ci := 0; ci < catCount; ci++ {
+	for ci := range a.items {
 		for i := range a.items[ci] {
 			if a.items[ci][i].rc.contains(x, y) {
 				return hit{kind: hitItem, cat: ci, idx: i}
@@ -799,15 +969,24 @@ func (a *app) onMouseMove(x, y int32) {
 		}
 	}
 	if a.dragging {
-		drop := -1
-		for ci := 0; ci < catCount; ci++ {
+		drop, idx := -1, -1
+		for ci := range a.colBand {
 			if a.colBand[ci].contains(x, y) {
 				drop = ci
+				rowH := a.iconCy + a.scale(10)
+				idx = int((y - a.headerRc[ci].bottom + rowH/2) / rowH)
+				if idx < 0 {
+					idx = 0
+				}
+				if idx > len(a.items[ci]) {
+					idx = len(a.items[ci])
+				}
 				break
 			}
 		}
-		if drop != a.dropCat {
+		if drop != a.dropCat || idx != a.dropIdx {
 			a.dropCat = drop
+			a.dropIdx = idx
 			procInvalidateRect.Call(uintptr(a.hwnd), 0, 0)
 		}
 		return
@@ -824,6 +1003,7 @@ func (a *app) onLButtonDown(x, y int32) {
 	a.pressPt = point{x, y}
 	a.dragging = false
 	a.dropCat = -1
+	a.dropIdx = -1
 	if a.pressed.kind != hitNone {
 		procSetCapture.Call(uintptr(a.hwnd))
 	}
@@ -833,15 +1013,12 @@ func (a *app) onLButtonUp(x, y int32) {
 	procReleaseCapture.Call()
 
 	if a.dragging {
-		// 드롭: 다른 열이면 이동. 창은 닫지 않고 제자리 유지.
 		if a.pressed.kind == hitItem && a.dropCat >= 0 {
-			src := a.items[a.pressed.cat][a.pressed.idx]
-			if a.dropCat != a.pressed.cat {
-				a.moveToCat(src.path, a.dropCat)
-			}
+			a.dropItem(a.pressed.cat, a.pressed.idx, a.dropCat, a.dropIdx)
 		}
 		a.dragging = false
 		a.dropCat = -1
+		a.dropIdx = -1
 		a.pressed = hit{kind: hitNone}
 		a.refresh()
 		return
@@ -862,13 +1039,19 @@ func (a *app) onLButtonUp(x, y int32) {
 			launch(a.update.url)
 		}
 		procDestroyWindow.Call(uintptr(a.hwnd))
+	case hitSettings:
+		launchWith("notepad.exe", configPath(a.dataDir))
 	case hitOpen:
 		launch(a.dataDir)
 		procDestroyWindow.Call(uintptr(a.hwnd))
+	case hitBackup:
+		a.doBackup()
+	case hitRestore:
+		a.doRestore()
 	case hitInstall:
 		a.modal = true
 		if err := installContextMenu(); err != nil {
-			alert("gotool", "우클릭 메뉴 등록 실패:\n"+err.Error(), mbIconError)
+			alertErr(errRegistry, "우클릭 메뉴 등록 실패", err)
 		} else {
 			alert("gotool", "탐색기 우클릭 메뉴에 \"gotool에 추가\"를 등록했습니다.\n\nWindows 11에서는 우클릭 후 \"더 많은 옵션 표시\" 안에 나타납니다.", mbIconInformation)
 		}
@@ -888,22 +1071,61 @@ func (a *app) onRButtonUp(x, y int32) {
 	a.refresh()
 }
 
-// moveToCat 은 항목 파일을 카테고리 강제 폴더로 옮긴다.
-func (a *app) moveToCat(path string, cat int) {
-	dir := filepath.Join(a.dataDir, catFolderNames[cat])
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		a.modal = true
-		alert("gotool", "폴더를 만들 수 없습니다:\n"+err.Error(), mbIconError)
-		a.modal = false
+// dropItem 은 드래그 결과를 반영한다: 같은 열이면 순서 변경, 다른 열이면 파일 이동 + 위치 지정.
+func (a *app) dropItem(srcCat, srcIdx, dstCat, dstIdx int) {
+	if srcCat < 0 || srcCat >= len(a.items) || srcIdx < 0 || srcIdx >= len(a.items[srcCat]) {
 		return
 	}
-	dest := uniqueDest(dir, filepath.Base(path))
-	if err := os.Rename(path, dest); err != nil {
-		a.modal = true
-		alert("gotool", "이동하지 못했습니다:\n"+err.Error(), mbIconError)
-		a.modal = false
-		procSetForegroundWindow.Call(uintptr(a.hwnd))
+	if dstIdx < 0 {
+		dstIdx = len(a.items[dstCat])
 	}
+	it := a.items[srcCat][srcIdx]
+
+	if dstCat == srcCat {
+		// 행간 이동(순서 변경)
+		if dstIdx > srcIdx {
+			dstIdx--
+		}
+		if dstIdx == srcIdx {
+			return
+		}
+		col := a.items[srcCat]
+		col = append(col[:srcIdx], col[srcIdx+1:]...)
+		if dstIdx > len(col) {
+			dstIdx = len(col)
+		}
+		col = append(col[:dstIdx], append([]uiItem{it}, col[dstIdx:]...)...)
+		a.items[srcCat] = col
+		a.saveOrderFromItems()
+		return
+	}
+
+	// 열간 이동: 파일을 대상 열 폴더로 옮기고 원하는 위치에 삽입
+	dir := filepath.Join(a.dataDir, a.cols[dstCat].Folder)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		a.modalAlertErr(errFolder, "폴더를 만들 수 없습니다", err)
+		return
+	}
+	dest := uniqueDest(dir, filepath.Base(it.path))
+	if err := os.Rename(it.path, dest); err != nil {
+		a.modalAlertErr(errMove, "이동하지 못했습니다", err)
+		return
+	}
+	rel, err := filepath.Rel(a.dataDir, dest)
+	if err != nil {
+		rel = filepath.Base(dest)
+	}
+	it.path = dest
+	it.rel = rel
+
+	src := a.items[srcCat]
+	a.items[srcCat] = append(src[:srcIdx], src[srcIdx+1:]...)
+	dst := a.items[dstCat]
+	if dstIdx > len(dst) {
+		dstIdx = len(dst)
+	}
+	a.items[dstCat] = append(dst[:dstIdx], append([]uiItem{it}, dst[dstIdx:]...)...)
+	a.saveOrderFromItems()
 }
 
 // confirmDelete 는 확인 후 바로가기를 삭제한다. 안전을 위해 데이터 폴더 안의 항목만 지운다.
@@ -924,31 +1146,204 @@ func (a *app) confirmDelete(path string) {
 		return
 	}
 	if err := os.RemoveAll(path); err != nil {
-		a.modal = true
-		alert("gotool", "삭제하지 못했습니다:\n"+err.Error(), mbIconError)
-		a.modal = false
+		a.modalAlertErr(errDelete, "삭제하지 못했습니다", err)
 	}
 }
 
-// ---- 폴더 스캔/분류 ----
+func (a *app) modalAlertErr(code, msg string, err error) {
+	a.modal = true
+	alertErr(code, msg, err)
+	a.modal = false
+	procSetForegroundWindow.Call(uintptr(a.hwnd))
+}
+
+// ---- 백업/복원 ----
+
+func (a *app) doBackup() {
+	a.modal = true
+	dest := saveFileDialog(a.hwnd, "gotool 백업 저장", "백업 파일 (*.zip)", "*.zip",
+		fmt.Sprintf("gotool-backup-%s.zip", time.Now().Format("20060102")), "zip")
+	a.modal = false
+	procSetForegroundWindow.Call(uintptr(a.hwnd))
+	if dest == "" {
+		return
+	}
+	if err := backupZip(a.dataDir, dest); err != nil {
+		a.modalAlertErr(errBackup, "백업을 저장하지 못했습니다", err)
+		return
+	}
+	a.modal = true
+	alert("gotool", "백업을 저장했습니다:\n"+dest+"\n\n포맷/재설치 후 gotool의 \"백업 불러오기\"로 복원할 수 있습니다.", mbIconInformation)
+	a.modal = false
+	procSetForegroundWindow.Call(uintptr(a.hwnd))
+}
+
+func (a *app) doRestore() {
+	a.modal = true
+	src := openFileDialog(a.hwnd, "gotool 백업 불러오기", "백업 파일 (*.zip)", "*.zip")
+	a.modal = false
+	procSetForegroundWindow.Call(uintptr(a.hwnd))
+	if src == "" {
+		return
+	}
+	if err := restoreZip(src, a.dataDir); err != nil {
+		a.modalAlertErr(errBackup, "백업을 불러오지 못했습니다", err)
+		return
+	}
+	a.modal = true
+	alert("gotool", "백업을 불러왔습니다. (같은 이름의 파일은 덮어씀)", mbIconInformation)
+	a.modal = false
+	procSetForegroundWindow.Call(uintptr(a.hwnd))
+	a.refresh()
+}
+
+func backupZip(dataDir, dest string) error {
+	zf, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer zf.Close()
+	zw := zip.NewWriter(zf)
+	defer zw.Close()
+
+	return filepath.WalkDir(dataDir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(dataDir, p)
+		if err != nil {
+			return err
+		}
+		w, err := zw.Create(filepath.ToSlash(rel))
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		_, err = w.Write(data)
+		return err
+	})
+}
+
+func restoreZip(src, dataDir string) error {
+	zr, err := zip.OpenReader(src)
+	if err != nil {
+		return err
+	}
+	defer zr.Close()
+
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		rel := filepath.FromSlash(f.Name)
+		if rel == "" || strings.Contains(rel, "..") || filepath.IsAbs(rel) {
+			continue
+		}
+		dest := filepath.Join(dataDir, rel)
+		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+			return err
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(dest, data, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ---- 파일 대화상자 ----
+
+func dialogFilter(desc, pattern string) *uint16 {
+	var buf []uint16
+	d, _ := windows.UTF16FromString(desc)
+	p, _ := windows.UTF16FromString(pattern)
+	buf = append(buf, d...) // 널 포함
+	buf = append(buf, p...) // 널 포함
+	buf = append(buf, 0)    // 이중 널 종료
+	return &buf[0]
+}
+
+func saveFileDialog(owner windows.Handle, title, filterDesc, filterPat, defName, defExt string) string {
+	var file [4096]uint16
+	n, _ := windows.UTF16FromString(defName)
+	copy(file[:], n)
+
+	ofn := openFileNameW{
+		lStructSize: uint32(unsafe.Sizeof(openFileNameW{})),
+		hwndOwner:   owner,
+		lpstrFilter: dialogFilter(filterDesc, filterPat),
+		lpstrFile:   &file[0],
+		nMaxFile:    uint32(len(file)),
+		lpstrTitle:  utf16Ptr(title),
+		lpstrDefExt: utf16Ptr(defExt),
+		flags:       ofnOverwritePrompt,
+	}
+	r, _, _ := procGetSaveFileNameW.Call(uintptr(unsafe.Pointer(&ofn)))
+	if r == 0 {
+		return ""
+	}
+	return windows.UTF16ToString(file[:])
+}
+
+func openFileDialog(owner windows.Handle, title, filterDesc, filterPat string) string {
+	var file [4096]uint16
+	ofn := openFileNameW{
+		lStructSize: uint32(unsafe.Sizeof(openFileNameW{})),
+		hwndOwner:   owner,
+		lpstrFilter: dialogFilter(filterDesc, filterPat),
+		lpstrFile:   &file[0],
+		nMaxFile:    uint32(len(file)),
+		lpstrTitle:  utf16Ptr(title),
+		flags:       ofnFileMustExist,
+	}
+	r, _, _ := procGetOpenFileNameW.Call(uintptr(unsafe.Pointer(&ofn)))
+	if r == 0 {
+		return ""
+	}
+	return windows.UTF16ToString(file[:])
+}
+
+// ---- 폴더 스캔/분류/순서 ----
 
 type item struct {
 	label   string
 	path    string
+	rel     string
 	iconSrc string
+	ord     int
 }
 
-// scan 은 데이터 폴더의 항목을 읽어 4개 카테고리로 나눈다.
-// 루트의 항목은 자동 분류, 카테고리 하위 폴더(웹/개발/비개발/다람쥐) 안의 항목은 그 열로 강제.
-func (a *app) scan() [catCount][]item {
-	var cats [catCount][]item
+// scan 은 데이터 폴더의 항목을 읽어 열별로 나눈다.
+// 루트의 항목은 자동 분류, 열 하위 폴더 안의 항목은 그 열로 강제.
+// 표시 순서는 .order 파일을 따르고, 새 항목은 뒤에 이름순으로 붙는다.
+func (a *app) scan() [][]item {
+	cats := make([][]item, len(a.cols))
+	order := a.loadOrder()
 
 	seen := a.loadSeen()
 	seenChanged := false
 	now := time.Now().Unix()
 	present := map[string]bool{}
 
-	appendItem := func(full string, isDir bool, cat int, iconSrc string) {
+	appendItem := func(full string, isDir bool, ci int, iconSrc string) {
+		rel, err := filepath.Rel(a.dataDir, full)
+		if err != nil {
+			rel = filepath.Base(full)
+		}
 		base := filepath.Base(full)
 		present[base] = true
 		first, ok := seen[base]
@@ -964,12 +1359,16 @@ func (a *app) scan() [catCount][]item {
 		if time.Duration(now-first)*time.Second < newBadgeAge {
 			label += " !" // 신규 표시(오른쪽)
 		}
-		cats[cat] = append(cats[cat], item{label: label, path: full, iconSrc: iconSrc})
+		ord, ok := order[filepath.ToSlash(rel)]
+		if !ok {
+			ord = 1 << 30
+		}
+		cats[ci] = append(cats[ci], item{label: label, path: full, rel: rel, iconSrc: iconSrc, ord: ord})
 	}
 
-	// 카테고리 강제 폴더
-	for ci := 0; ci < catCount; ci++ {
-		dir := filepath.Join(a.dataDir, catFolderNames[ci])
+	// 열 강제 폴더
+	for ci := range a.cols {
+		dir := filepath.Join(a.dataDir, a.cols[ci].Folder)
 		os.MkdirAll(dir, 0o755)
 		entries, err := os.ReadDir(dir)
 		if err != nil {
@@ -980,7 +1379,7 @@ func (a *app) scan() [catCount][]item {
 				continue
 			}
 			full := filepath.Join(dir, e.Name())
-			_, iconSrc := classifyAuto(full, e.IsDir())
+			_, iconSrc := a.classifyAuto(full, e.IsDir())
 			appendItem(full, e.IsDir(), ci, iconSrc)
 		}
 	}
@@ -993,12 +1392,12 @@ func (a *app) scan() [catCount][]item {
 			if skipName(name) {
 				continue
 			}
-			if e.IsDir() && isCatFolder(name) {
+			if e.IsDir() && a.isColFolder(name) {
 				continue
 			}
 			full := filepath.Join(a.dataDir, name)
-			cat, iconSrc := classifyAuto(full, e.IsDir())
-			appendItem(full, e.IsDir(), cat, iconSrc)
+			kind, iconSrc := a.classifyAuto(full, e.IsDir())
+			appendItem(full, e.IsDir(), a.autoCol(kind), iconSrc)
 		}
 	}
 
@@ -1014,7 +1413,10 @@ func (a *app) scan() [catCount][]item {
 	}
 
 	for ci := range cats {
-		sort.Slice(cats[ci], func(i, j int) bool {
+		sort.SliceStable(cats[ci], func(i, j int) bool {
+			if cats[ci][i].ord != cats[ci][j].ord {
+				return cats[ci][i].ord < cats[ci][j].ord
+			}
 			return strings.ToLower(cats[ci][i].label) < strings.ToLower(cats[ci][j].label)
 		})
 	}
@@ -1022,16 +1424,74 @@ func (a *app) scan() [catCount][]item {
 }
 
 func skipName(name string) bool {
-	return strings.HasPrefix(name, ".") || strings.EqualFold(name, "desktop.ini")
+	return strings.HasPrefix(name, ".") ||
+		strings.EqualFold(name, "desktop.ini") ||
+		strings.EqualFold(name, "config.json")
 }
 
-func isCatFolder(name string) bool {
-	for _, n := range catFolderNames {
-		if name == n {
+func (a *app) isColFolder(name string) bool {
+	for _, c := range a.cols {
+		if name == c.Folder {
 			return true
 		}
 	}
 	return false
+}
+
+// autoCol 은 자동 분류 종류("web"/"dev"/"etc")를 받을 열 번호를 정한다.
+func (a *app) autoCol(kind string) int {
+	for i, c := range a.cols {
+		if c.Auto == kind {
+			return i
+		}
+	}
+	if kind != "etc" {
+		for i, c := range a.cols {
+			if c.Auto == "etc" {
+				return i
+			}
+		}
+	}
+	return 0
+}
+
+// ---- 표시 순서(.order): dataDir 기준 상대 경로를 표시 순서대로 저장 ----
+
+func (a *app) orderPath() string {
+	return filepath.Join(a.dataDir, ".order")
+}
+
+func (a *app) loadOrder() map[string]int {
+	m := map[string]int{}
+	data, err := os.ReadFile(a.orderPath())
+	if err != nil {
+		return m
+	}
+	i := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(strings.TrimRight(line, "\r"))
+		if line == "" {
+			continue
+		}
+		if _, dup := m[line]; !dup {
+			m[line] = i
+			i++
+		}
+	}
+	return m
+}
+
+func (a *app) saveOrderFromItems() {
+	var b strings.Builder
+	for ci := range a.items {
+		for _, it := range a.items[ci] {
+			b.WriteString(filepath.ToSlash(it.rel))
+			b.WriteString("\n")
+		}
+	}
+	if err := os.WriteFile(a.orderPath(), []byte(b.String()), 0o644); err != nil {
+		logErr(errFolder, ".order 저장 실패: "+err.Error())
+	}
 }
 
 // ---- 신규(!) 기록: shortcuts\.seen 에 "파일이름<TAB>처음본시각" 저장 ----
@@ -1076,13 +1536,10 @@ func (a *app) saveSeen(m map[string]int64) {
 
 // ---- 자동 분류 ----
 
-// classifyAuto 는 항목의 카테고리(열)와 아이콘 소스 경로를 정한다.
-//   - .url  http/https      → 웹
-//   - 그 외(폴더/앱/파일)   → 이름·대상 경로에 개발 키워드가 있으면 개발, 없으면 비개발
-//   - 다람쥐는 수동 이동 전용
-func classifyAuto(full string, isDir bool) (int, string) {
+// classifyAuto 는 항목의 자동 분류 종류("web"/"dev"/"etc")와 아이콘 소스 경로를 정한다.
+func (a *app) classifyAuto(full string, isDir bool) (string, string) {
 	if isDir {
-		return textCat(full), full
+		return a.textKind(full), full
 	}
 	switch strings.ToLower(filepath.Ext(full)) {
 	case ".url":
@@ -1091,27 +1548,31 @@ func classifyAuto(full string, isDir bool) (int, string) {
 		if strings.HasPrefix(lower, "file:") {
 			if local := fileURLToPath(target); local != "" {
 				if _, err := os.Stat(local); err == nil {
-					return textCat(full + " " + local), local
+					return a.textKind(full + " " + local), local
 				}
 			}
-			return textCat(full), full
+			return a.textKind(full), full
 		}
-		return catWeb, full
+		return "web", full
 	case ".lnk":
-		return textCat(full + " " + lnkTarget(full)), full
+		return a.textKind(full + " " + lnkTarget(full)), full
 	default:
-		return textCat(full), full
+		return a.textKind(full), full
 	}
 }
 
-func textCat(s string) int {
+func (a *app) textKind(s string) string {
 	s = strings.ToLower(s)
-	for _, k := range devKeywords {
-		if strings.Contains(s, k) {
-			return catDev
+	keys := a.devKeys
+	if len(keys) == 0 {
+		keys = defaultDevKeywords
+	}
+	for _, k := range keys {
+		if k != "" && strings.Contains(s, strings.ToLower(k)) {
+			return "dev"
 		}
 	}
-	return catEtc
+	return "etc"
 }
 
 // urlTarget 은 .url(인터넷 바로가기) 파일에서 URL= 값을 읽는다.
@@ -1154,11 +1615,13 @@ func checkUpdate(ch chan<- *updateInfo) {
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", repoOwner, repoName))
 	if err != nil {
+		logErr(errUpdate, "업데이트 확인 실패: "+err.Error())
 		send(nil)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		logErr(errUpdate, fmt.Sprintf("업데이트 확인 실패: HTTP %d", resp.StatusCode))
 		send(nil)
 		return
 	}
@@ -1171,7 +1634,8 @@ func checkUpdate(ch chan<- *updateInfo) {
 			URL  string `json:"browser_download_url"`
 		} `json:"assets"`
 	}
-	if json.NewDecoder(resp.Body).Decode(&rel) != nil || rel.TagName == "" {
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil || rel.TagName == "" {
+		logErr(errUpdate, "업데이트 응답 해석 실패")
 		send(nil)
 		return
 	}
@@ -1266,13 +1730,13 @@ func addItem(src string) {
 	}
 	st, err := os.Stat(src)
 	if err != nil {
-		alert("gotool", "경로를 찾을 수 없습니다:\n"+src, mbIconError)
+		alertErr(errAdd, "경로를 찾을 수 없습니다:\n"+src, nil)
 		return
 	}
 
 	dir, err := resolveDir(nil)
 	if err != nil {
-		alert("gotool", err.Error(), mbIconError)
+		alertErr(errFolder, err.Error(), nil)
 		return
 	}
 
@@ -1282,7 +1746,7 @@ func addItem(src string) {
 	if !st.IsDir() && (ext == ".lnk" || ext == ".url") {
 		dest = uniqueDest(dir, base)
 		if err := copyFile(src, dest); err != nil {
-			alert("gotool", "복사하지 못했습니다:\n"+err.Error(), mbIconError)
+			alertErr(errAdd, "복사하지 못했습니다", err)
 			return
 		}
 	} else {
@@ -1292,14 +1756,13 @@ func addItem(src string) {
 		}
 		dest = uniqueDest(dir, name+".lnk")
 		if err := createLnk(src, dest); err != nil {
-			alert("gotool", "바로가기를 만들지 못했습니다:\n"+err.Error(), mbIconError)
+			alertErr(errAdd, "바로가기를 만들지 못했습니다", err)
 			return
 		}
 	}
 
-	cat, _ := classifyAuto(dest, false)
 	label := strings.TrimSuffix(filepath.Base(dest), filepath.Ext(dest))
-	alert("gotool", fmt.Sprintf("추가되었습니다: %s\n분류: %s\n\n(메뉴에서 항목을 드래그하면 다른 열로 옮길 수 있습니다)", label, catNames[cat]), mbIconInformation)
+	alert("gotool", fmt.Sprintf("추가되었습니다: %s\n\n(패널에서 항목을 드래그하면 원하는 열/순서로 옮길 수 있습니다)", label), mbIconInformation)
 }
 
 func uniqueDest(dir, name string) string {
@@ -1462,12 +1925,45 @@ func createLnk(target, dest string) error {
 	return nil
 }
 
+// ---- 오류 기록 ----
+
+// logErr 는 exe 옆 gotool.log 에 "시각 <TAB> 버전 <TAB> 코드 <TAB> 내용" 형식으로 기록한다.
+func logErr(code, msg string) {
+	dir := "."
+	if exe, err := os.Executable(); err == nil {
+		dir = filepath.Dir(exe)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "gotool.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s\t%s\t%s\t%s\r\n", time.Now().Format("2006-01-02 15:04:05"), version, code, strings.ReplaceAll(msg, "\n", " "))
+}
+
+// alertErr 는 오류를 기록하고 코드와 함께 사용자에게 보여준다.
+func alertErr(code, msg string, err error) {
+	detail := msg
+	if err != nil {
+		detail += "\n" + err.Error()
+	}
+	logErr(code, detail)
+	alert("gotool", fmt.Sprintf("[%s] %s", code, detail), mbIconError)
+}
+
 // ---- 공용 ----
 
 func launch(path string) {
 	op, _ := windows.UTF16PtrFromString("open")
 	p, _ := windows.UTF16PtrFromString(path)
 	procShellExecuteW.Call(0, uintptr(unsafe.Pointer(op)), uintptr(unsafe.Pointer(p)), 0, 0, swShowNormal)
+}
+
+func launchWith(exe, arg string) {
+	op, _ := windows.UTF16PtrFromString("open")
+	e, _ := windows.UTF16PtrFromString(exe)
+	p, _ := windows.UTF16PtrFromString(`"` + arg + `"`)
+	procShellExecuteW.Call(0, uintptr(unsafe.Pointer(op)), uintptr(unsafe.Pointer(e)), uintptr(unsafe.Pointer(p)), 0, swShowNormal)
 }
 
 func getSystemMetrics(index int32, fallback int32) int32 {
