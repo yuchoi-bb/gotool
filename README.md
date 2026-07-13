@@ -108,7 +108,7 @@ return
 [Releases](../../releases/latest) 페이지에서 `gotool.exe`를 내려받으세요.
 
 ```
-go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=v0.9.0" -o gotool.exe .
+go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=v0.10.0" -o gotool.exe .
 ```
 
 `main`에 푸시하거나 `v*` 태그를 만들면 GitHub Actions가 자동으로 빌드해 릴리스에 `gotool.exe`를 올립니다.

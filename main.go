@@ -150,6 +150,9 @@ var (
 	procCreateDIBSection       = gdi32.NewProc("CreateDIBSection")
 	procCreateBitmap           = gdi32.NewProc("CreateBitmap")
 	procGdiFlush               = gdi32.NewProc("GdiFlush")
+	procCreateSolidBrush       = gdi32.NewProc("CreateSolidBrush")
+	procRoundRect              = gdi32.NewProc("RoundRect")
+	procGetStockObject         = gdi32.NewProc("GetStockObject")
 
 	procSHGetFileInfoW = shell32.NewProc("SHGetFileInfoW")
 	procShellExecuteW  = shell32.NewProc("ShellExecuteW")
@@ -162,6 +165,9 @@ var (
 
 	procGetSaveFileNameW = comdlg32.NewProc("GetSaveFileNameW")
 	procGetOpenFileNameW = comdlg32.NewProc("GetOpenFileNameW")
+
+	dwmapi                    = windows.NewLazySystemDLL("dwmapi.dll")
+	procDwmSetWindowAttribute = dwmapi.NewProc("DwmSetWindowAttribute")
 )
 
 const (
@@ -251,7 +257,67 @@ const (
 
 	ofnOverwritePrompt = 0x00000002
 	ofnFileMustExist   = 0x00001000
+
+	nullPenStock = 8 // NULL_PEN
+
+	dwmwaCornerPreference = 33 // DWMWA_WINDOW_CORNER_PREFERENCE (Win11)
+	dwmwcpRound           = 2  // DWMWCP_ROUND
 )
+
+// ---- 색상 팔레트(라이트/다크 자동) ----
+
+type palette struct {
+	bg         uint32 // 배경
+	text       uint32 // 본문
+	subtle     uint32 // 흐린 텍스트(비어 있음, 진행 중 등)
+	hover      uint32 // 마우스 오버 배경
+	hoverText  uint32 // 마우스 오버 텍스트
+	border     uint32 // 창 테두리
+	sep        uint32 // 구분선
+	accent     uint32 // 포인트 색(열 제목, 업데이트, 드롭 표시)
+	accentSoft uint32 // 포인트 색 연한 배경
+}
+
+func rgbRef(r, g, b uint8) uint32 { return uint32(r) | uint32(g)<<8 | uint32(b)<<16 }
+
+// systemDarkMode 는 Windows 앱 테마가 다크인지 확인한다.
+func systemDarkMode() bool {
+	k, err := registry.OpenKey(registry.CURRENT_USER,
+		`Software\Microsoft\Windows\CurrentVersion\Themes\Personalize`, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer k.Close()
+	v, _, err := k.GetIntegerValue("AppsUseLightTheme")
+	return err == nil && v == 0
+}
+
+func loadPalette() palette {
+	if systemDarkMode() {
+		return palette{
+			bg:         rgbRef(0x2B, 0x2B, 0x30),
+			text:       rgbRef(0xF2, 0xF2, 0xF5),
+			subtle:     rgbRef(0xA6, 0xA6, 0xB0),
+			hover:      rgbRef(0x41, 0x3C, 0x50),
+			hoverText:  rgbRef(0xFF, 0xFF, 0xFF),
+			border:     rgbRef(0x4A, 0x4A, 0x52),
+			sep:        rgbRef(0x3E, 0x3E, 0x46),
+			accent:     rgbRef(0xB9, 0x9A, 0xF8),
+			accentSoft: rgbRef(0x45, 0x3B, 0x5E),
+		}
+	}
+	return palette{
+		bg:         rgbRef(0xFC, 0xFC, 0xFE),
+		text:       rgbRef(0x25, 0x25, 0x2A),
+		subtle:     rgbRef(0x8C, 0x8C, 0x96),
+		hover:      rgbRef(0xEF, 0xE9, 0xFC),
+		hoverText:  rgbRef(0x33, 0x1D, 0x6E),
+		border:     rgbRef(0xE0, 0xE0, 0xE8),
+		sep:        rgbRef(0xEC, 0xEC, 0xF2),
+		accent:     rgbRef(0x7C, 0x3A, 0xED),
+		accentSoft: rgbRef(0xF2, 0xEC, 0xFE),
+	}
+}
 
 // ---- 설정(config.json): 열 구성 ----
 
@@ -517,14 +583,16 @@ type button struct {
 }
 
 type app struct {
-	dataDir string
-	cols    []column
-	devKeys []string
-	hwnd    windows.Handle
-	font    windows.Handle
-	iconCx  int32
-	iconCy  int32
-	dpi     int32
+	dataDir  string
+	cols     []column
+	devKeys  []string
+	hwnd     windows.Handle
+	font     windows.Handle
+	fontBold windows.Handle
+	pal      palette
+	iconCx   int32
+	iconCy   int32
+	dpi      int32
 
 	items    [][]uiItem
 	colBand  []rect
@@ -677,8 +745,11 @@ func runPanel(dir string) {
 	if a.dpi <= 0 {
 		a.dpi = 96
 	}
-	a.font = createUIFont(a.dpi)
+	a.pal = loadPalette()
+	a.font = createUIFont(a.dpi, 400)
+	a.fontBold = createUIFont(a.dpi, 600)
 	defer procDeleteObject.Call(uintptr(a.font))
+	defer procDeleteObject.Call(uintptr(a.fontBold))
 
 	if !a.createWindow() {
 		alertErr(errWindow, "창을 생성하지 못했습니다", nil)
@@ -745,13 +816,21 @@ func (a *app) createWindow() bool {
 		wsExTopmost|wsExToolWindow,
 		uintptr(unsafe.Pointer(className)),
 		uintptr(unsafe.Pointer(utf16Ptr("gotool"))),
-		wsPopup|wsBorder,
+		wsPopup, // 테두리는 팔레트 색으로 직접 그린다
 		0, 0, 100, 100,
 		0, 0, hInst, 0,
 	)
 	a.hwnd = windows.Handle(hwnd)
+	if hwnd != 0 {
+		// Windows 11: 둥근 모서리 (Win10 이하에서는 조용히 무시됨)
+		pref := uint32(dwmwcpRound)
+		procDwmSetWindowAttribute.Call(hwnd, dwmwaCornerPreference, uintptr(unsafe.Pointer(&pref)), 4)
+	}
 	return hwnd != 0
 }
+
+// rowH 는 항목/버튼 한 줄의 높이(여유 있는 클릭 영역).
+func (a *app) rowH() int32 { return a.iconCy + a.scale(14) }
 
 func (a *app) wndProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 	switch msg {
@@ -983,11 +1062,11 @@ func (a *app) layout() {
 	hdc, _, _ := procGetDC.Call(uintptr(a.hwnd))
 	oldFont, _, _ := procSelectObject.Call(hdc, uintptr(a.font))
 
-	pad := a.scale(8)
-	rowH := a.iconCy + a.scale(10)
-	sepW := a.scale(11)
-	iconPad := a.scale(6)
-	minCol := a.scale(130)
+	pad := a.scale(10)
+	rowH := a.rowH()
+	sepW := a.scale(13)
+	iconPad := a.scale(8)
+	minCol := a.scale(140)
 	maxCol := a.scale(330)
 
 	textW := func(s string) int32 {
@@ -1013,7 +1092,7 @@ func (a *app) layout() {
 				w = tw
 			}
 		}
-		w += a.iconCx + iconPad + pad*2
+		w += a.iconCx + iconPad + pad*2 + a.scale(8)
 		if w < minCol {
 			w = minCol
 		}
@@ -1064,7 +1143,7 @@ func (a *app) layout() {
 		}{hitInstall, "🖱 우클릭 \"gotool에 추가\" 메뉴 등록"})
 	}
 	a.buttons = a.buttons[:0]
-	y := itemsBottom + a.scale(6)
+	y := itemsBottom + a.scale(8)
 	for _, l := range labels {
 		a.buttons = append(a.buttons, button{kind: l.kind, label: l.label, rc: rect{pad, y, winW - pad, y + rowH}})
 		y += rowH
@@ -1103,99 +1182,136 @@ func (a *app) paint(hdc uintptr) {
 	oldFont, _, _ := procSelectObject.Call(memDC, uintptr(a.font))
 	procSetBkMode.Call(memDC, bkTransparent)
 
-	brush := func(idx uintptr) uintptr { b, _, _ := procGetSysColorBrush.Call(idx); return b }
-	color := func(idx uintptr) uintptr { c, _, _ := procGetSysColor.Call(idx); return c }
+	pal := a.pal
+	brushes := map[uint32]uintptr{}
+	brush := func(c uint32) uintptr {
+		if b, ok := brushes[c]; ok {
+			return b
+		}
+		b, _, _ := procCreateSolidBrush.Call(uintptr(c))
+		brushes[c] = b
+		return b
+	}
+	defer func() {
+		for _, b := range brushes {
+			procDeleteObject.Call(b)
+		}
+	}()
+	nullPen, _, _ := procGetStockObject.Call(nullPenStock)
 
-	procFillRect.Call(memDC, uintptr(unsafe.Pointer(&rc)), brush(colorMenu))
+	// 둥근 채우기(마우스 오버 등)
+	fillRound := func(r rect, c uint32, rad int32) {
+		oldB, _, _ := procSelectObject.Call(memDC, brush(c))
+		oldP, _, _ := procSelectObject.Call(memDC, nullPen)
+		procRoundRect.Call(memDC, uintptr(r.left), uintptr(r.top), uintptr(r.right)+1, uintptr(r.bottom)+1, uintptr(rad), uintptr(rad))
+		procSelectObject.Call(memDC, oldB)
+		procSelectObject.Call(memDC, oldP)
+	}
 
-	drawText := func(r rect, s string, col uintptr) {
+	procFillRect.Call(memDC, uintptr(unsafe.Pointer(&rc)), brush(pal.bg))
+
+	drawText := func(r rect, s string, col uint32) {
 		u, err := windows.UTF16FromString(s)
 		if err != nil {
 			return
 		}
-		procSetTextColor.Call(memDC, col)
+		procSetTextColor.Call(memDC, uintptr(col))
 		procDrawTextW.Call(memDC, uintptr(unsafe.Pointer(&u[0])), ^uintptr(0), uintptr(unsafe.Pointer(&r)), dtFlags)
 	}
 
-	rowText := func(r rect, label string, icon windows.Handle, hovered, grayed bool) {
+	rad := a.scale(6)
+	rowText := func(r rect, label string, icon windows.Handle, hovered, grayed bool, hoverFill, textCol uint32) {
 		if hovered {
-			procFillRect.Call(memDC, uintptr(unsafe.Pointer(&r)), brush(colorHighlight))
+			hr := rect{r.left + a.scale(2), r.top + a.scale(1), r.right - a.scale(2), r.bottom - a.scale(1)}
+			fillRound(hr, hoverFill, rad)
 		}
-		x := r.left + a.scale(8)
+		x := r.left + a.scale(10)
 		if icon != 0 {
 			iy := r.top + (r.bottom-r.top-a.iconCy)/2
 			procDrawIconEx.Call(memDC, uintptr(x), uintptr(iy), uintptr(icon), uintptr(a.iconCx), uintptr(a.iconCy), 0, 0, diNormal)
 		}
 		tr := r
-		tr.left = x + a.iconCx + a.scale(6)
-		col := color(colorMenuText)
+		tr.left = x + a.iconCx + a.scale(8)
+		col := textCol
 		if grayed {
-			col = color(colorGrayText)
-		}
-		if hovered {
-			col = color(colorHighlightText)
+			col = pal.subtle
+		} else if hovered {
+			col = pal.hoverText
 		}
 		drawText(tr, label, col)
 	}
 
-	// 업데이트 버튼
+	// 업데이트 버튼(포인트 색으로 강조)
 	if a.update != nil {
-		label := "⬆ 새 버전 " + a.update.tag + " 업데이트 (클릭 한 번으로 자동 교체)"
+		label := "⬆ 새 버전 " + a.update.tag + " 업데이트 — 클릭 한 번으로 자동 교체"
 		if a.updating {
 			label = "⬇ " + a.update.tag + " 다운로드 중... 잠시만 기다려 주세요"
 		}
-		rowText(a.updRc, label, 0, a.hover.kind == hitUpdate && !a.updating, a.updating)
-		line := rect{a.updRc.left, a.updRc.bottom + a.scale(2), a.updRc.right, a.updRc.bottom + a.scale(3)}
-		procFillRect.Call(memDC, uintptr(unsafe.Pointer(&line)), brush(color3DShadow))
+		hovered := a.hover.kind == hitUpdate && !a.updating
+		fillRound(rect{a.updRc.left, a.updRc.top, a.updRc.right, a.updRc.bottom}, pal.accentSoft, rad)
+		if hovered {
+			fillRound(rect{a.updRc.left, a.updRc.top, a.updRc.right, a.updRc.bottom}, pal.hover, rad)
+		}
+		tr := a.updRc
+		tr.left += a.scale(12)
+		if a.updating {
+			drawText(tr, label, pal.subtle)
+		} else {
+			drawText(tr, label, pal.accent)
+		}
 	}
 
 	// 열
 	for ci := range a.cols {
 		hr := a.headerRc[ci]
-		drawText(rect{hr.left + a.scale(8), hr.top, hr.right, hr.bottom}, a.cols[ci].Name, color(colorGrayText))
-		line := rect{hr.left, hr.bottom - a.scale(2), hr.right, hr.bottom - a.scale(1)}
-		procFillRect.Call(memDC, uintptr(unsafe.Pointer(&line)), brush(color3DShadow))
+		procSelectObject.Call(memDC, uintptr(a.fontBold))
+		drawText(rect{hr.left + a.scale(10), hr.top, hr.right, hr.bottom}, a.cols[ci].Name, pal.accent)
+		procSelectObject.Call(memDC, uintptr(a.font))
+		line := rect{hr.left + a.scale(2), hr.bottom - a.scale(2), hr.right - a.scale(2), hr.bottom - a.scale(1)}
+		procFillRect.Call(memDC, uintptr(unsafe.Pointer(&line)), brush(pal.sep))
 
 		if len(a.items[ci]) == 0 {
-			r := rect{hr.left, hr.bottom, hr.right, hr.bottom + a.iconCy + a.scale(10)}
-			drawText(rect{r.left + a.scale(8), r.top, r.right, r.bottom}, "(비어 있음)", color(colorGrayText))
+			r := rect{hr.left, hr.bottom, hr.right, hr.bottom + a.rowH()}
+			drawText(rect{r.left + a.scale(10), r.top, r.right, r.bottom}, "(비어 있음)", pal.subtle)
 		}
 		for i, it := range a.items[ci] {
 			hovered := !a.dragging && a.hover.kind == hitItem && a.hover.cat == ci && a.hover.idx == i
 			graying := a.dragging && a.pressed.kind == hitItem && a.pressed.cat == ci && a.pressed.idx == i
-			rowText(it.rc, it.label, it.icon, hovered, graying)
+			rowText(it.rc, it.label, it.icon, hovered, graying, pal.hover, pal.text)
 		}
 		if ci < len(a.cols)-1 {
-			sx := a.colBand[ci].right + a.scale(5)
-			line := rect{sx, a.colBand[ci].top, sx + a.scale(1), a.colBand[ci].bottom}
-			procFillRect.Call(memDC, uintptr(unsafe.Pointer(&line)), brush(color3DShadow))
+			sx := a.colBand[ci].right + a.scale(6)
+			line := rect{sx, a.colBand[ci].top + a.scale(2), sx + a.scale(1), a.colBand[ci].bottom - a.scale(2)}
+			procFillRect.Call(memDC, uintptr(unsafe.Pointer(&line)), brush(pal.sep))
 		}
 	}
 
 	// 드래그 중: 드롭 대상 열 강조 + 삽입 위치 표시
 	if a.dragging && a.dropCat >= 0 {
 		band := a.colBand[a.dropCat]
-		procFrameRect.Call(memDC, uintptr(unsafe.Pointer(&band)), brush(colorHighlight))
+		procFrameRect.Call(memDC, uintptr(unsafe.Pointer(&band)), brush(pal.accent))
 		inner := rect{band.left + 1, band.top + 1, band.right - 1, band.bottom - 1}
-		procFrameRect.Call(memDC, uintptr(unsafe.Pointer(&inner)), brush(colorHighlight))
+		procFrameRect.Call(memDC, uintptr(unsafe.Pointer(&inner)), brush(pal.accent))
 
 		if a.dropIdx >= 0 {
-			rowH := a.iconCy + a.scale(10)
-			ly := a.headerRc[a.dropCat].bottom + int32(a.dropIdx)*rowH
-			mark := rect{band.left + a.scale(2), ly - a.scale(1), band.right - a.scale(2), ly + a.scale(2)}
-			procFillRect.Call(memDC, uintptr(unsafe.Pointer(&mark)), brush(colorHighlight))
+			ly := a.headerRc[a.dropCat].bottom + int32(a.dropIdx)*a.rowH()
+			mark := rect{band.left + a.scale(4), ly - a.scale(1), band.right - a.scale(4), ly + a.scale(2)}
+			fillRound(mark, pal.accent, a.scale(2))
 		}
 	}
 
 	// 하단 관리 버튼
 	if len(a.buttons) > 0 {
 		top := a.buttons[0].rc.top
-		line := rect{a.buttons[0].rc.left, top - a.scale(3), a.buttons[0].rc.right, top - a.scale(2)}
-		procFillRect.Call(memDC, uintptr(unsafe.Pointer(&line)), brush(color3DShadow))
+		line := rect{a.buttons[0].rc.left + a.scale(2), top - a.scale(4), a.buttons[0].rc.right - a.scale(2), top - a.scale(3)}
+		procFillRect.Call(memDC, uintptr(unsafe.Pointer(&line)), brush(pal.sep))
 	}
 	for _, b := range a.buttons {
-		rowText(b.rc, b.label, 0, a.hover.kind == b.kind, false)
+		rowText(b.rc, b.label, 0, a.hover.kind == b.kind, false, pal.hover, pal.subtle)
 	}
+
+	// 창 테두리
+	procFrameRect.Call(memDC, uintptr(unsafe.Pointer(&rc)), brush(pal.border))
 
 	procBitBlt.Call(hdc, 0, 0, uintptr(w), uintptr(h), memDC, 0, 0, srcCopy)
 
@@ -1238,7 +1354,7 @@ func (a *app) onMouseMove(x, y int32) {
 		for ci := range a.colBand {
 			if a.colBand[ci].contains(x, y) {
 				drop = ci
-				rowH := a.iconCy + a.scale(10)
+				rowH := a.rowH()
 				idx = int((y - a.headerRc[ci].bottom + rowH/2) / rowH)
 				if idx < 0 {
 					idx = 0
@@ -2509,12 +2625,12 @@ func iconHandle(path string) windows.Handle {
 	return sfi.hIcon
 }
 
-func createUIFont(dpi int32) windows.Handle {
+func createUIFont(dpi int32, weight int32) windows.Handle {
 	height := -(9 * dpi) / 72 // 9pt
 	face := utf16Ptr("맑은 고딕")
 	f, _, _ := procCreateFontW.Call(
 		uintptr(int(height)), 0, 0, 0,
-		400, // FW_NORMAL
+		uintptr(weight),
 		0, 0, 0,
 		1, // DEFAULT_CHARSET
 		0, 0,
