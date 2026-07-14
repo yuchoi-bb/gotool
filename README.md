@@ -80,9 +80,20 @@
 | E08 | 백업/복원 실패 |
 | E09 | 설정 파일(config.json) 오류 |
 | E10 | 자동 업데이트(exe 교체) 실패 |
+| P01 | 느린 시작 프로파일(내부 처리 300ms 초과 시 기록) |
 | E99 | 예기치 못한 오류(패닉) |
 
 오류창에도 `[E03]`처럼 코드가 함께 표시됩니다. 문제가 생기면 `gotool.log` 내용을 알려주세요.
+
+## 실행이 느릴 때
+
+gotool은 폴더 목록만 읽고 즉시 패널을 띄우며, 아이콘·분류 결과는 캐시(`shortcuts\.iconcache`, `.meta`)로 재사용합니다.
+그런데도 느리다면 `gotool.log`의 `P01` 기록을 확인하세요.
+
+- **P01이 없거나 수십 ms인데 느리다** → 앱 바깥 문제입니다. 대부분 Windows Defender가 서명 없는 exe를
+  실행할 때마다 검사하는 것이 원인이며, `Windows 보안 → 바이러스 및 위협 방지 → 제외 추가`에
+  gotool 폴더를 등록하면 해결됩니다.
+- **P01 수치가 크다** → 그 내용을 이슈로 알려주세요.
 
 ## AutoHotkey 연동 (ESC 두 번으로 실행)
 
@@ -108,7 +119,7 @@ return
 [Releases](../../releases/latest) 페이지에서 `gotool.exe`를 내려받으세요.
 
 ```
-go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=v0.10.0" -o gotool.exe .
+go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=v0.11.0" -o gotool.exe .
 ```
 
 `main`에 푸시하거나 `v*` 태그를 만들면 GitHub Actions가 자동으로 빌드해 릴리스에 `gotool.exe`를 올립니다.

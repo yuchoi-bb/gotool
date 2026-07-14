@@ -724,6 +724,7 @@ func resolveDir(args []string) (string, error) {
 // ---- 패널 창 ----
 
 func runPanel(dir string) {
+	t0 := time.Now()
 	a := &app{
 		dataDir:  dir,
 		iconCx:   getSystemMetrics(smCxSmIcon, 16),
@@ -756,7 +757,9 @@ func runPanel(dir string) {
 		return
 	}
 
+	tReload := time.Now()
 	a.reload()
+	reloadMs := time.Since(tReload).Milliseconds()
 
 	// 커서 위치에 표시. 커서가 있는 모니터의 작업 영역 안에서만 열리게 보정
 	// (모니터 가장자리라도 옆 모니터로 넘어가지 않음)
@@ -766,6 +769,13 @@ func runPanel(dir string) {
 	procSetWindowPos.Call(uintptr(a.hwnd), 0, uintptr(x), uintptr(y), uintptr(a.winW), uintptr(a.winH), swpNoZorder)
 	procShowWindow.Call(uintptr(a.hwnd), swShow)
 	procSetForegroundWindow.Call(uintptr(a.hwnd))
+
+	// 시작 성능 프로파일: 내부 처리가 느리면 원인 파악용으로 기록한다.
+	// 여기 수치가 작은데도 실행이 느리게 느껴지면 원인은 앱 바깥(Defender/SmartScreen의
+	// exe 검사, 디스크 캐시 미적재 등)이다.
+	if total := time.Since(t0).Milliseconds(); total > 300 {
+		logErr("P01", fmt.Sprintf("느린 시작: 창 표시까지 내부 처리 %dms (폴더 스캔·아이콘 복원 %dms)", total, reloadMs))
+	}
 
 	// 업데이트 확인은 백그라운드로. 끝나면 UI 스레드에 알림.
 	go func() {
@@ -2089,6 +2099,41 @@ func (a *app) scan() [][]item {
 		cats[ci] = append(cats[ci], item{label: label, path: full, rel: rel, iconSrc: iconSrc, ord: ord, mtime: mtime})
 	}
 
+	// 분류 결과 캐시(.meta): .lnk/.url 분류는 대상 경로 확인(os.Stat)이 필요해
+	// 대상이 끊긴 네트워크 드라이브면 수 초씩 걸릴 수 있다. mtime이 같으면 재사용.
+	meta, metaChanged := a.loadMeta(), false
+	presentRel := map[string]bool{}
+	classify := func(e fs.DirEntry, full string) (string, string, int64) {
+		var mtime int64
+		if fi, err := e.Info(); err == nil {
+			mtime = fi.ModTime().Unix()
+		}
+		rel, err := filepath.Rel(a.dataDir, full)
+		if err != nil {
+			rel = filepath.Base(full)
+		}
+		relKey := filepath.ToSlash(rel)
+		presentRel[relKey] = true
+		if e.IsDir() {
+			return a.textKind(full), full, mtime // 폴더 분류는 저렴해서 캐시 불필요
+		}
+		if m, ok := meta[relKey]; ok && m.mtime == mtime {
+			src := m.iconSrc
+			if src == "" {
+				src = full
+			}
+			return m.kind, src, mtime
+		}
+		kind, iconSrc := a.classifyAuto(full, false)
+		src := iconSrc
+		if src == full {
+			src = ""
+		}
+		meta[relKey] = metaEnt{mtime: mtime, kind: kind, iconSrc: src}
+		metaChanged = true
+		return kind, iconSrc, mtime
+	}
+
 	// 열 강제 폴더
 	for ci := range a.cols {
 		dir := filepath.Join(a.dataDir, a.cols[ci].Folder)
@@ -2102,7 +2147,7 @@ func (a *app) scan() [][]item {
 				continue
 			}
 			full := filepath.Join(dir, e.Name())
-			_, iconSrc := a.classifyAuto(full, e.IsDir())
+			_, iconSrc, _ := classify(e, full)
 			appendItem(e, full, e.IsDir(), ci, iconSrc)
 		}
 	}
@@ -2119,12 +2164,12 @@ func (a *app) scan() [][]item {
 				continue
 			}
 			full := filepath.Join(a.dataDir, name)
-			kind, iconSrc := a.classifyAuto(full, e.IsDir())
+			kind, iconSrc, _ := classify(e, full)
 			appendItem(e, full, e.IsDir(), a.autoCol(kind), iconSrc)
 		}
 	}
 
-	// 사라진 항목은 신규 기록에서 정리
+	// 사라진 항목은 신규 기록/분류 캐시에서 정리
 	for name := range seen {
 		if !present[name] {
 			delete(seen, name)
@@ -2133,6 +2178,15 @@ func (a *app) scan() [][]item {
 	}
 	if seenChanged {
 		a.saveSeen(seen)
+	}
+	for relKey := range meta {
+		if !presentRel[relKey] {
+			delete(meta, relKey)
+			metaChanged = true
+		}
+	}
+	if metaChanged {
+		a.saveMeta(meta)
 	}
 
 	for ci := range cats {
@@ -2176,6 +2230,61 @@ func (a *app) autoCol(kind string) int {
 		}
 	}
 	return 0
+}
+
+// ---- 분류 캐시(.meta): "상대경로 <TAB> mtime <TAB> 분류 <TAB> 아이콘소스" ----
+
+type metaEnt struct {
+	mtime   int64
+	kind    string
+	iconSrc string // 빈 값이면 파일 자신
+}
+
+func (a *app) metaPath() string {
+	return filepath.Join(a.dataDir, ".meta")
+}
+
+func (a *app) loadMeta() map[string]metaEnt {
+	m := map[string]metaEnt{}
+	data, err := os.ReadFile(a.metaPath())
+	if err != nil {
+		return m
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimRight(line, "\r")
+		parts := strings.SplitN(line, "\t", 4)
+		if len(parts) != 4 {
+			continue
+		}
+		ts, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		src := parts[3]
+		if src == "-" {
+			src = ""
+		}
+		m[parts[0]] = metaEnt{mtime: ts, kind: parts[2], iconSrc: src}
+	}
+	return m
+}
+
+func (a *app) saveMeta(m map[string]metaEnt) {
+	var b strings.Builder
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		e := m[k]
+		src := e.iconSrc
+		if src == "" {
+			src = "-"
+		}
+		fmt.Fprintf(&b, "%s\t%d\t%s\t%s\n", k, e.mtime, e.kind, src)
+	}
+	os.WriteFile(a.metaPath(), []byte(b.String()), 0o644)
 }
 
 // ---- 표시 순서(.order): dataDir 기준 상대 경로를 표시 순서대로 저장 ----
