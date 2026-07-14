@@ -8,7 +8,7 @@ on:
     inputs:
       tag:
         description: "Release tag to create"
-        default: "v0.12.0"
+        default: "v0.13.0"
         required: true
 
 permissions:
@@ -26,7 +26,7 @@ jobs:
 
       - name: Build
         env:
-          RELEASE_TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || 'v0.12.0' }}
+          RELEASE_TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || 'v0.13.0' }}
         run: go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=$env:RELEASE_TAG" -o gotool.exe .
 
       - name: Upload artifact
@@ -38,5 +38,5 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || 'v0.12.0' }}
+          tag_name: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || 'v0.13.0' }}
           files: gotool.exe

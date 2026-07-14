@@ -11,7 +11,19 @@
 - **오른쪽 클릭** → 삭제(확인창)
 - **`!` 표시(이름 오른쪽)** → 추가된 지 10분 이내의 신규 항목
 - **⬆ 새 버전 업데이트** → 새 릴리스가 나오면 맨 위에 버튼이 자동 표시. **클릭 한 번**이면 직접 내려받아 exe를 자동 교체하고 새 버전으로 재실행 (작업 관리자·수동 복사 불필요)
-- **ESC 또는 바깥 클릭** → 닫기
+- **ESC 또는 바깥 클릭** → 닫기(트레이 상주)
+
+## 트레이 상주 + 더블 ESC (즉시 실행)
+
+gotool은 한 번 실행하면 **트레이에 상주**합니다. 패널을 닫아도 프로세스는 살아 있어서 다시 열 때 프로세스 시작 비용(디스크 로딩, 백신 검사)이 전혀 없습니다.
+
+- **ESC 두 번(0.4초 이내)** → 커서 위치에 패널 즉시 표시 (내장 기능 — AutoHotkey 불필요!)
+- **트레이 아이콘 클릭** → 패널 표시
+- **트레이 아이콘 우클릭** → `열기 / Windows 시작 시 자동 실행(추천) / 종료`
+- `gotool.exe`를 다시 실행해도 새 창을 띄우지 않고 상주 인스턴스가 패널을 보여줍니다
+- 더블 ESC를 끄려면 `config.json`에 `"disableEscHotkey": true` 추가
+
+**빠른 설정**: 트레이 우클릭 → "Windows 시작 시 자동 실행" 체크. 이후에는 부팅하면 자동으로 대기하고 있다가 ESC 두 번에 즉시 나타납니다.
 
 ## 자동 분류
 
@@ -105,14 +117,11 @@ gotool은 폴더 목록만 읽고 즉시 패널을 띄우며, 아이콘·분류 
   gotool 폴더를 등록하면 해결됩니다.
 - **P01 수치가 크다** → 그 내용을 이슈로 알려주세요.
 
-## AutoHotkey 연동 (ESC 두 번으로 실행)
+## AutoHotkey 연동 (선택)
 
-```ahk
-~Esc::
-if (A_PriorHotkey = "~Esc" && A_TimeSincePriorHotkey < 400)
-    Run "C:\tools\gotool.exe"
-return
-```
+**더블 ESC가 내장되어 있어 AutoHotkey는 더 이상 필요 없습니다.** 기존 AHK 스크립트를 그대로 둬도
+동작은 하지만(상주 인스턴스에 표시 신호만 전달), 내장 단축키를 쓰는 편이 훨씬 빠릅니다.
+다른 키를 쓰고 싶을 때만 AHK로 `Run "C:\tools\gotool.exe"`를 연결하세요.
 
 ## 명령어 정리
 
@@ -129,7 +138,7 @@ return
 [Releases](../../releases/latest) 페이지에서 `gotool.exe`를 내려받으세요.
 
 ```
-go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=v0.12.0" -o gotool.exe .
+go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=v0.13.0" -o gotool.exe .
 ```
 
 `main`에 푸시하거나 `v*` 태그를 만들면 GitHub Actions가 자동으로 빌드해 릴리스에 `gotool.exe`를 올립니다.

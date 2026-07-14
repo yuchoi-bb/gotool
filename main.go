@@ -135,6 +135,14 @@ var (
 	procSetWindowTextW      = user32.NewProc("SetWindowTextW")
 	procAdjustWindowRectEx  = user32.NewProc("AdjustWindowRectEx")
 	procIsDialogMessageW    = user32.NewProc("IsDialogMessageW")
+	procFindWindowW         = user32.NewProc("FindWindowW")
+	procSetWindowsHookExW   = user32.NewProc("SetWindowsHookExW")
+	procUnhookWindowsHookEx = user32.NewProc("UnhookWindowsHookEx")
+	procCallNextHookEx      = user32.NewProc("CallNextHookEx")
+	procCreatePopupMenu     = user32.NewProc("CreatePopupMenu")
+	procDestroyMenu         = user32.NewProc("DestroyMenu")
+	procAppendMenuW         = user32.NewProc("AppendMenuW")
+	procTrackPopupMenuEx    = user32.NewProc("TrackPopupMenuEx")
 
 	procCreateCompatibleDC     = gdi32.NewProc("CreateCompatibleDC")
 	procCreateCompatibleBitmap = gdi32.NewProc("CreateCompatibleBitmap")
@@ -154,8 +162,9 @@ var (
 	procRoundRect              = gdi32.NewProc("RoundRect")
 	procGetStockObject         = gdi32.NewProc("GetStockObject")
 
-	procSHGetFileInfoW = shell32.NewProc("SHGetFileInfoW")
-	procShellExecuteW  = shell32.NewProc("ShellExecuteW")
+	procSHGetFileInfoW   = shell32.NewProc("SHGetFileInfoW")
+	procShellExecuteW    = shell32.NewProc("ShellExecuteW")
+	procShellNotifyIconW = shell32.NewProc("Shell_NotifyIconW")
 
 	procCoInitializeEx   = ole32.NewProc("CoInitializeEx")
 	procCoUninitialize   = ole32.NewProc("CoUninitialize")
@@ -211,6 +220,8 @@ const (
 	wmAppUpdate   = 0x8000 + 1 // 업데이트 확인 완료(고루틴 → UI 스레드)
 	wmAppUpdated  = 0x8000 + 2 // 자동 업데이트(다운로드/교체) 완료
 	wmAppIcon     = 0x8000 + 3 // 백그라운드 아이콘 추출 결과 도착
+	wmAppShow     = 0x8000 + 4 // 패널 표시 요청(두 번째 인스턴스/트레이/더블 ESC)
+	wmAppTray     = 0x8000 + 5 // 트레이 아이콘 콜백
 
 	waInactive = 0
 	vkEscape   = 0x1B
@@ -262,6 +273,24 @@ const (
 
 	dwmwaCornerPreference = 33 // DWMWA_WINDOW_CORNER_PREFERENCE (Win11)
 	dwmwcpRound           = 2  // DWMWCP_ROUND
+
+	swHide = 0
+
+	whKeyboardLL = 13
+	wmKeyUp      = 0x0101
+	wmSysKeyUp   = 0x0105
+
+	nimAdd     = 0
+	nimDelete  = 2
+	nifMessage = 0x1
+	nifIcon    = 0x2
+	nifTip     = 0x4
+
+	mfString    = 0x0000
+	mfChecked   = 0x0008
+	mfSeparator = 0x0800
+
+	tpmReturnCmd = 0x0100
 )
 
 // ---- 색상 팔레트(라이트/다크 자동) ----
@@ -329,9 +358,10 @@ type column struct {
 }
 
 type appConfig struct {
-	Columns     []column `json:"columns"`
-	DevKeywords []string `json:"devKeywords,omitempty"` // "dev" 자동 분류 키워드(비우면 기본값)
-	CmdSeeded   bool     `json:"cmdSeeded,omitempty"`   // 명령어 열 1회 자동 추가 여부
+	Columns          []column `json:"columns"`
+	DevKeywords      []string `json:"devKeywords,omitempty"`      // "dev" 자동 분류 키워드(비우면 기본값)
+	CmdSeeded        bool     `json:"cmdSeeded,omitempty"`        // 명령어 열 1회 자동 추가 여부
+	DisableEscHotkey bool     `json:"disableEscHotkey,omitempty"` // true면 내장 더블 ESC 단축키 끔
 }
 
 func defaultConfig() appConfig {
@@ -503,6 +533,34 @@ type iconInfoStruct struct {
 	hbmColor windows.Handle
 }
 
+type notifyIconData struct {
+	cbSize           uint32
+	_                uint32
+	hWnd             windows.Handle
+	uID              uint32
+	uFlags           uint32
+	uCallbackMessage uint32
+	_                uint32
+	hIcon            windows.Handle
+	szTip            [128]uint16
+	dwState          uint32
+	dwStateMask      uint32
+	szInfo           [256]uint16
+	uVersion         uint32
+	szInfoTitle      [64]uint16
+	dwInfoFlags      uint32
+	guidItem         windows.GUID
+	hBalloonIcon     windows.Handle
+}
+
+type kbdllHookStruct struct {
+	vkCode      uint32
+	scanCode    uint32
+	flags       uint32
+	time        uint32
+	dwExtraInfo uintptr
+}
+
 // monitorWorkFromPoint 는 해당 좌표가 속한 모니터의 작업 영역을 돌려준다.
 // 창이 모니터 경계를 넘어 옆 모니터로 걸치지 않게 하는 데 쓴다.
 func monitorWorkFromPoint(pt point) rect {
@@ -644,6 +702,12 @@ type app struct {
 	cmdAdd    *cmdAddUI // 열려 있는 명령어 추가 창(없으면 nil)
 	cmdClsReg bool
 
+	// 상주(트레이) 모드
+	trayAdded bool
+	hook      uintptr // 더블 ESC 감지용 저수준 키보드 훅
+	lastEsc   int64   // 마지막 ESC keyup 시각(ms)
+	lastUpd   time.Time
+
 	// 아이콘 비동기 로딩/캐시: 패널을 먼저 띄우고 아이콘은 뒤에서 채운다.
 	gen       int64 // reload 세대(이전 워커 결과 무시용, atomic)
 	iconCh    chan iconResult
@@ -776,23 +840,26 @@ func runPanel(dir string) {
 	defer procDeleteObject.Call(uintptr(a.font))
 	defer procDeleteObject.Call(uintptr(a.fontBold))
 
+	// 상주 모드: 이미 실행 중인 인스턴스가 있으면 표시 요청만 보내고 즉시 종료
+	if prev := findExistingPanel(); prev != 0 {
+		procPostMessageW.Call(prev, wmAppShow, 0, 0)
+		return
+	}
+
 	if !a.createWindow() {
 		alertErr(errWindow, "창을 생성하지 못했습니다", nil)
 		return
 	}
 
-	tReload := time.Now()
-	a.reload()
-	reloadMs := time.Since(tReload).Milliseconds()
+	a.addTray()
+	if !loadConfig(a.dataDir).DisableEscHotkey {
+		a.installEscHook() // 내장 더블 ESC 단축키(프로세스 재실행 없이 즉시 표시)
+	}
+	a.panelAlive = true
 
-	// 커서 위치에 표시. 커서가 있는 모니터의 작업 영역 안에서만 열리게 보정
-	// (모니터 가장자리라도 옆 모니터로 넘어가지 않음)
-	var pt point
-	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
-	x, y := clampIntoWork(monitorWorkFromPoint(pt), pt.x, pt.y, a.winW, a.winH)
-	procSetWindowPos.Call(uintptr(a.hwnd), 0, uintptr(x), uintptr(y), uintptr(a.winW), uintptr(a.winH), swpNoZorder)
-	procShowWindow.Call(uintptr(a.hwnd), swShow)
-	procSetForegroundWindow.Call(uintptr(a.hwnd))
+	tReload := time.Now()
+	a.showAtCursor()
+	reloadMs := time.Since(tReload).Milliseconds()
 
 	// 시작 성능 프로파일: 내부 처리가 느리면 원인 파악용으로 기록한다.
 	// 여기 수치가 작은데도 실행이 느리게 느껴지면 원인은 앱 바깥(Defender/SmartScreen의
@@ -800,14 +867,6 @@ func runPanel(dir string) {
 	if total := time.Since(t0).Milliseconds(); total > 300 {
 		logErr("P01", fmt.Sprintf("느린 시작: 창 표시까지 내부 처리 %dms (폴더 스캔·아이콘 복원 %dms)", total, reloadMs))
 	}
-
-	// 업데이트 확인은 백그라운드로. 끝나면 UI 스레드에 알림.
-	go func() {
-		checkUpdate(a.updateCh)
-		procPostMessageW.Call(uintptr(a.hwnd), wmAppUpdate, 0, 0)
-	}()
-
-	a.panelAlive = true
 
 	var m msgStruct
 	for {
@@ -830,6 +889,167 @@ func runPanel(dir string) {
 		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))
 	}
 	a.freeIcons()
+}
+
+func findExistingPanel() uintptr {
+	cls := utf16Ptr("gotoolPanelWnd")
+	h, _, _ := procFindWindowW.Call(uintptr(unsafe.Pointer(cls)), 0)
+	return h
+}
+
+// showAtCursor 는 폴더를 다시 읽고 커서가 있는 모니터의 작업 영역 안에 패널을 띄운다.
+func (a *app) showAtCursor() {
+	a.reload()
+	a.maybeCheckUpdate()
+
+	var pt point
+	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	x, y := clampIntoWork(monitorWorkFromPoint(pt), pt.x, pt.y, a.winW, a.winH)
+	procSetWindowPos.Call(uintptr(a.hwnd), 0, uintptr(x), uintptr(y), uintptr(a.winW), uintptr(a.winH), swpNoZorder)
+	procShowWindow.Call(uintptr(a.hwnd), swShow)
+	procSetForegroundWindow.Call(uintptr(a.hwnd))
+}
+
+// hidePanel 은 패널을 숨기기만 한다(프로세스는 트레이에 상주).
+func (a *app) hidePanel() {
+	procShowWindow.Call(uintptr(a.hwnd), swHide)
+}
+
+// quitPanel 은 상주를 끝내고 완전히 종료한다.
+func (a *app) quitPanel() {
+	procDestroyWindow.Call(uintptr(a.hwnd))
+}
+
+// maybeCheckUpdate 는 6시간에 한 번만 백그라운드로 업데이트를 확인한다.
+func (a *app) maybeCheckUpdate() {
+	if a.update != nil || time.Since(a.lastUpd) < 6*time.Hour {
+		return
+	}
+	a.lastUpd = time.Now()
+	hwnd := a.hwnd
+	go func() {
+		checkUpdate(a.updateCh)
+		procPostMessageW.Call(uintptr(hwnd), wmAppUpdate, 0, 0)
+	}()
+}
+
+// ---- 트레이 아이콘 / 더블 ESC 훅 ----
+
+func (a *app) addTray() {
+	hInst, _, _ := procGetModuleHandleW.Call(0)
+	icon, _, _ := procLoadIconW.Call(hInst, 1)
+	nid := notifyIconData{
+		cbSize:           uint32(unsafe.Sizeof(notifyIconData{})),
+		hWnd:             a.hwnd,
+		uID:              1,
+		uFlags:           nifMessage | nifIcon | nifTip,
+		uCallbackMessage: wmAppTray,
+		hIcon:            windows.Handle(icon),
+	}
+	tip, _ := windows.UTF16FromString("gotool — ESC 두 번 또는 클릭")
+	copy(nid.szTip[:], tip)
+	if r, _, _ := procShellNotifyIconW.Call(nimAdd, uintptr(unsafe.Pointer(&nid))); r != 0 {
+		a.trayAdded = true
+	}
+}
+
+func (a *app) removeTray() {
+	if !a.trayAdded {
+		return
+	}
+	nid := notifyIconData{
+		cbSize: uint32(unsafe.Sizeof(notifyIconData{})),
+		hWnd:   a.hwnd,
+		uID:    1,
+	}
+	procShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&nid)))
+	a.trayAdded = false
+}
+
+// installEscHook 은 저수준 키보드 훅으로 "ESC 두 번(400ms 이내)"을 감지해 패널을 띄운다.
+func (a *app) installEscHook() {
+	cb := windows.NewCallback(func(nCode, wparam uintptr, k *kbdllHookStruct) uintptr {
+		if int32(nCode) == 0 && (wparam == wmKeyUp || wparam == wmSysKeyUp) && k != nil && k.vkCode == vkEscape {
+			now := time.Now().UnixMilli()
+			if now-a.lastEsc < 400 {
+				a.lastEsc = 0
+				procPostMessageW.Call(uintptr(a.hwnd), wmAppShow, 0, 0)
+			} else {
+				a.lastEsc = now
+			}
+		}
+		r, _, _ := procCallNextHookEx.Call(0, nCode, wparam, uintptr(unsafe.Pointer(k)))
+		return r
+	})
+	a.hook, _, _ = procSetWindowsHookExW.Call(whKeyboardLL, cb, 0, 0)
+}
+
+func (a *app) uninstallEscHook() {
+	if a.hook != 0 {
+		procUnhookWindowsHookEx.Call(a.hook)
+		a.hook = 0
+	}
+}
+
+// trayMenu 는 트레이 아이콘 우클릭 메뉴를 띄운다.
+func (a *app) trayMenu() {
+	hMenu, _, _ := procCreatePopupMenu.Call()
+	defer procDestroyMenu.Call(hMenu)
+
+	appendItem := func(id uintptr, flags uintptr, text string) {
+		procAppendMenuW.Call(hMenu, flags, id, uintptr(unsafe.Pointer(utf16Ptr(text))))
+	}
+	appendItem(1, mfString, "열기")
+	autoFlags := uintptr(mfString)
+	if autoStartEnabled() {
+		autoFlags |= mfChecked
+	}
+	appendItem(2, autoFlags, "Windows 시작 시 자동 실행")
+	procAppendMenuW.Call(hMenu, mfSeparator, 0, 0)
+	appendItem(3, mfString, "종료")
+
+	var pt point
+	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	procSetForegroundWindow.Call(uintptr(a.hwnd))
+	cmd, _, _ := procTrackPopupMenuEx.Call(hMenu, tpmReturnCmd, uintptr(pt.x), uintptr(pt.y), uintptr(a.hwnd), 0)
+	switch cmd {
+	case 1:
+		a.showAtCursor()
+	case 2:
+		if err := toggleAutoStart(); err != nil {
+			a.modalAlertErr(errRegistry, "자동 실행 설정 실패", err)
+		}
+	case 3:
+		a.quitPanel()
+	}
+}
+
+const autoStartKey = `Software\Microsoft\Windows\CurrentVersion\Run`
+
+func autoStartEnabled() bool {
+	k, err := registry.OpenKey(registry.CURRENT_USER, autoStartKey, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer k.Close()
+	_, _, err = k.GetStringValue("gotool")
+	return err == nil
+}
+
+func toggleAutoStart() error {
+	k, err := registry.OpenKey(registry.CURRENT_USER, autoStartKey, registry.QUERY_VALUE|registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
+	if _, _, err := k.GetStringValue("gotool"); err == nil {
+		return k.DeleteValue("gotool")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	return k.SetStringValue("gotool", `"`+exe+`"`)
 }
 
 func (a *app) createWindow() bool {
@@ -905,14 +1125,35 @@ func (a *app) wndProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 		}
 	case wmKeyDown:
 		if wparam == vkEscape && !a.updating {
-			procDestroyWindow.Call(hwnd)
+			a.hidePanel()
 			return 0
 		}
 	case wmActivate:
 		if wparam&0xFFFF == waInactive && !a.modal && !a.dragging && !a.updating {
-			procDestroyWindow.Call(hwnd)
+			a.hidePanel()
 			return 0
 		}
+	case wmAppShow:
+		if a.modal {
+			if a.settings != nil {
+				procSetForegroundWindow.Call(uintptr(a.settings.hwnd))
+			} else if a.cmdAdd != nil {
+				procSetForegroundWindow.Call(uintptr(a.cmdAdd.hwnd))
+			}
+			return 0
+		}
+		a.showAtCursor()
+		return 0
+	case wmAppTray:
+		switch lparam {
+		case wmLButtonUp:
+			if !a.modal {
+				a.showAtCursor()
+			}
+		case wmRButtonUp:
+			a.trayMenu()
+		}
+		return 0
 	case wmAppUpdate:
 		select {
 		case u := <-a.updateCh:
@@ -952,7 +1193,9 @@ func (a *app) wndProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 		return 0
 	case wmDestroy:
 		a.panelAlive = false
-		if a.settings == nil {
+		a.removeTray()
+		a.uninstallEscHook()
+		if a.settings == nil && a.cmdAdd == nil {
 			procPostQuitMessage.Call(0)
 		}
 		return 0
@@ -1474,7 +1717,7 @@ func (a *app) onLButtonUp(x, y int32) {
 	switch prev.kind {
 	case hitItem:
 		a.launchItem(a.items[prev.cat][prev.idx].path)
-		procDestroyWindow.Call(uintptr(a.hwnd))
+		a.hidePanel()
 	case hitAddCmd:
 		a.openCmdAdd()
 	case hitUpdate:
@@ -1498,7 +1741,7 @@ func (a *app) onLButtonUp(x, y int32) {
 		a.openSettings()
 	case hitOpen:
 		launch(a.dataDir)
-		procDestroyWindow.Call(uintptr(a.hwnd))
+		a.hidePanel()
 	case hitBackup:
 		a.doBackup()
 	case hitRestore:
