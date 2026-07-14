@@ -325,21 +325,25 @@ type column struct {
 	Name   string `json:"name"`           // 열 제목(패널에 표시)
 	Folder string `json:"folder"`         // shortcuts 안의 하위 폴더 이름
 	Auto   string `json:"auto,omitempty"` // 자동 분류 대상: "web" | "dev" | "etc" | ""(수동 전용)
+	Type   string `json:"type,omitempty"` // "cmd" = 명령어 열(클릭 시 cmd /k 로 실행, 창 유지)
 }
 
 type appConfig struct {
 	Columns     []column `json:"columns"`
 	DevKeywords []string `json:"devKeywords,omitempty"` // "dev" 자동 분류 키워드(비우면 기본값)
+	CmdSeeded   bool     `json:"cmdSeeded,omitempty"`   // 명령어 열 1회 자동 추가 여부
 }
 
 func defaultConfig() appConfig {
 	return appConfig{
 		Columns: []column{
+			{Name: "⌨ 명령어", Folder: "명령어", Type: "cmd"},
 			{Name: "🌐 웹", Folder: "웹", Auto: "web"},
 			{Name: "💻 개발", Folder: "개발", Auto: "dev"},
 			{Name: "📦 비개발", Folder: "비개발", Auto: "etc"},
 			{Name: "🐿 다람쥐", Folder: "다람쥐"},
 		},
+		CmdSeeded: true,
 	}
 }
 
@@ -386,6 +390,20 @@ func loadConfig(dataDir string) appConfig {
 		alertErr(errConfig, "설정 파일에 유효한 열이 없어 기본 구성으로 실행합니다", nil)
 		return defaultConfig()
 	}
+	// 기존 사용자 마이그레이션: 명령어 열이 없으면 맨 왼쪽에 1회 추가
+	hasCmd := false
+	for _, c := range cols {
+		if c.Type == "cmd" {
+			hasCmd = true
+		}
+	}
+	if !hasCmd && !cfg.CmdSeeded {
+		cols = append([]column{{Name: "⌨ 명령어", Folder: "명령어", Type: "cmd"}}, cols...)
+		cfg.CmdSeeded = true
+		cfg.Columns = cols
+		saveConfig(dataDir, cfg)
+	}
+	cfg.CmdSeeded = true
 	cfg.Columns = cols
 	return cfg
 }
@@ -568,6 +586,7 @@ const (
 	hitBackup
 	hitRestore
 	hitInstall
+	hitAddCmd
 )
 
 type hit struct {
@@ -619,6 +638,11 @@ type app struct {
 	settings   *settingsUI // 열려 있는 설정 창(없으면 nil)
 	setClsReg  bool
 	panelAlive bool
+
+	cmdColIdx int       // "cmd" 타입 열 번호(-1 = 없음)
+	addCmdRc  rect      // "＋ 명령어 추가" 행
+	cmdAdd    *cmdAddUI // 열려 있는 명령어 추가 창(없으면 nil)
+	cmdClsReg bool
 
 	// 아이콘 비동기 로딩/캐시: 패널을 먼저 띄우고 아이콘은 뒤에서 채운다.
 	gen       int64 // reload 세대(이전 워커 결과 무시용, atomic)
@@ -791,9 +815,14 @@ func runPanel(dir string) {
 		if r == 0 || int32(r) == -1 {
 			break
 		}
-		// 설정 창이 열려 있으면 TAB/Enter/ESC 등 대화상자 키 처리
+		// 설정/명령어 추가 창이 열려 있으면 TAB/Enter/ESC 등 대화상자 키 처리
 		if a.settings != nil && a.settings.hwnd != 0 {
 			if d, _, _ := procIsDialogMessageW.Call(uintptr(a.settings.hwnd), uintptr(unsafe.Pointer(&m))); d != 0 {
+				continue
+			}
+		}
+		if a.cmdAdd != nil && a.cmdAdd.hwnd != 0 {
+			if d, _, _ := procIsDialogMessageW.Call(uintptr(a.cmdAdd.hwnd), uintptr(unsafe.Pointer(&m))); d != 0 {
 				continue
 			}
 		}
@@ -947,6 +976,13 @@ func (a *app) reload() {
 	a.devKeys = cfg.DevKeywords
 	if len(a.devKeys) == 0 {
 		a.devKeys = defaultDevKeywords
+	}
+	a.cmdColIdx = -1
+	for i, c := range a.cols {
+		if c.Type == "cmd" {
+			a.cmdColIdx = i
+			break
+		}
 	}
 
 	// 패널을 빨리 띄우기 위해 아이콘은 여기서 추출하지 않는다:
@@ -1110,7 +1146,11 @@ func (a *app) layout() {
 			w = maxCol
 		}
 		colW[ci] = w
-		if r := len(a.items[ci]); r > maxRows {
+		r := len(a.items[ci])
+		if ci == a.cmdColIdx {
+			r++ // "＋ 명령어 추가" 행
+		}
+		if r > maxRows {
 			maxRows = r
 		}
 	}
@@ -1124,12 +1164,16 @@ func (a *app) layout() {
 	itemsBottom := colTop + rowH + int32(maxRows)*rowH // 헤더 + 항목들
 
 	x := pad
+	a.addCmdRc = rect{}
 	for ci := 0; ci < n; ci++ {
 		a.headerRc[ci] = rect{x, colTop, x + colW[ci], colTop + rowH}
 		y := colTop + rowH
 		for i := range a.items[ci] {
 			a.items[ci][i].rc = rect{x, y, x + colW[ci], y + rowH}
 			y += rowH
+		}
+		if ci == a.cmdColIdx {
+			a.addCmdRc = rect{x, y, x + colW[ci], y + rowH}
 		}
 		a.colBand[ci] = rect{x, colTop, x + colW[ci], itemsBottom}
 		x += colW[ci] + sepW
@@ -1289,6 +1333,9 @@ func (a *app) paint(hdc uintptr) {
 			graying := a.dragging && a.pressed.kind == hitItem && a.pressed.cat == ci && a.pressed.idx == i
 			rowText(it.rc, it.label, it.icon, hovered, graying, pal.hover, pal.text)
 		}
+		if ci == a.cmdColIdx {
+			rowText(a.addCmdRc, "＋ 명령어 추가", 0, !a.dragging && a.hover.kind == hitAddCmd, false, pal.hover, pal.accent)
+		}
 		if ci < len(a.cols)-1 {
 			sx := a.colBand[ci].right + a.scale(6)
 			line := rect{sx, a.colBand[ci].top + a.scale(2), sx + a.scale(1), a.colBand[ci].bottom - a.scale(2)}
@@ -1341,6 +1388,9 @@ func (a *app) hitTest(x, y int32) hit {
 		if b.rc.contains(x, y) {
 			return hit{kind: b.kind}
 		}
+	}
+	if a.cmdColIdx >= 0 && a.addCmdRc.contains(x, y) {
+		return hit{kind: hitAddCmd}
 	}
 	for ci := range a.items {
 		for i := range a.items[ci] {
@@ -1423,8 +1473,10 @@ func (a *app) onLButtonUp(x, y int32) {
 
 	switch prev.kind {
 	case hitItem:
-		launch(a.items[prev.cat][prev.idx].path)
+		a.launchItem(a.items[prev.cat][prev.idx].path)
 		procDestroyWindow.Call(uintptr(a.hwnd))
+	case hitAddCmd:
+		a.openCmdAdd()
 	case hitUpdate:
 		// 브라우저로 보내지 않고 직접 내려받아 자기 자신을 교체한다.
 		if a.update == nil || a.updating {
@@ -1590,6 +1642,7 @@ type setRow struct {
 	autoBtn  windows.Handle
 	delBtn   windows.Handle
 	auto     string
+	typ      string // 열 타입("cmd" 등)은 설정 UI에서 건드리지 않고 유지
 }
 
 type settingsUI struct {
@@ -1710,7 +1763,7 @@ func (s *settingsUI) child(class, text string, style uintptr, id int) windows.Ha
 }
 
 func (s *settingsUI) addRowControls(c column) {
-	r := &setRow{auto: c.Auto}
+	r := &setRow{auto: c.Auto, typ: c.Type}
 	r.nameEd = s.child("EDIT", c.Name, wsChild|wsVisible|wsBorder|wsTabStop|esAutoHScroll, idSetRow)
 	r.folderEd = s.child("EDIT", c.Folder, wsChild|wsVisible|wsBorder|wsTabStop|esAutoHScroll, idSetRow)
 	r.autoBtn = s.child("BUTTON", autoLabel(c.Auto), wsChild|wsVisible|wsTabStop, idSetRow)
@@ -1865,13 +1918,13 @@ func (s *settingsUI) save() bool {
 		if name == "" {
 			name = folder
 		}
-		cols = append(cols, column{Name: name, Folder: folder, Auto: r.auto})
+		cols = append(cols, column{Name: name, Folder: folder, Auto: r.auto, Type: r.typ})
 	}
 	if len(cols) == 0 {
 		s.warn("열은 최소 1개가 필요합니다.")
 		return false
 	}
-	saveConfig(s.a.dataDir, appConfig{Columns: cols, DevKeywords: s.devKeys})
+	saveConfig(s.a.dataDir, appConfig{Columns: cols, DevKeywords: s.devKeys, CmdSeeded: true})
 	return true
 }
 
@@ -1883,6 +1936,211 @@ func getWindowText(h windows.Handle) string {
 	buf := make([]uint16, n+1)
 	procGetWindowTextW.Call(uintptr(h), uintptr(unsafe.Pointer(&buf[0])), n+1)
 	return windows.UTF16ToString(buf)
+}
+
+// ---- 명령어 추가 창 ----
+
+type cmdAddUI struct {
+	a      *app
+	hwnd   windows.Handle
+	cmdEd  windows.Handle
+	nameEd windows.Handle
+}
+
+func (a *app) openCmdAdd() {
+	if a.cmdAdd != nil {
+		procSetForegroundWindow.Call(uintptr(a.cmdAdd.hwnd))
+		return
+	}
+	if a.cmdColIdx < 0 {
+		return
+	}
+	a.modal = true
+	c := &cmdAddUI{a: a}
+	a.cmdAdd = c
+	if !c.create() {
+		a.cmdAdd = nil
+		a.modal = false
+		a.modalAlertErr(errWindow, "명령어 추가 창을 만들지 못했습니다", nil)
+	}
+}
+
+func (c *cmdAddUI) create() bool {
+	a := c.a
+	hInst, _, _ := procGetModuleHandleW.Call(0)
+	className := utf16Ptr("gotoolCmdAddWnd")
+
+	if !a.cmdClsReg {
+		arrow, _, _ := procLoadCursorW.Call(0, idcArrow)
+		appIcon, _, _ := procLoadIconW.Call(hInst, 1)
+		wndProc := windows.NewCallback(a.cmdAddProc)
+		wc := wndClassEx{
+			cbSize:        uint32(unsafe.Sizeof(wndClassEx{})),
+			lpfnWndProc:   wndProc,
+			hInstance:     windows.Handle(hInst),
+			hIcon:         windows.Handle(appIcon),
+			hIconSm:       windows.Handle(appIcon),
+			hCursor:       windows.Handle(arrow),
+			hbrBackground: windows.Handle(colorMenu + 1),
+			lpszClassName: className,
+		}
+		procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
+		a.cmdClsReg = true
+	}
+
+	hwnd, _, _ := procCreateWindowExW.Call(
+		wsExTopmost|wsExToolWindow,
+		uintptr(unsafe.Pointer(className)),
+		uintptr(unsafe.Pointer(utf16Ptr("gotool — 명령어 추가"))),
+		settingsStyle,
+		0, 0, 10, 10,
+		0, 0, hInst, 0,
+	)
+	if hwnd == 0 {
+		return false
+	}
+	c.hwnd = windows.Handle(hwnd)
+
+	child := func(class, text string, style uintptr, id int) windows.Handle {
+		h, _, _ := procCreateWindowExW.Call(
+			0,
+			uintptr(unsafe.Pointer(utf16Ptr(class))),
+			uintptr(unsafe.Pointer(utf16Ptr(text))),
+			style,
+			0, 0, 10, 10,
+			uintptr(c.hwnd), uintptr(id), hInst, 0,
+		)
+		procSendMessageW.Call(h, wmSetFont, uintptr(a.font), 1)
+		return windows.Handle(h)
+	}
+
+	m := a.scale(12)
+	eh := a.scale(24)
+	lw := a.scale(420)
+	labelH := a.scale(18)
+
+	move := func(h windows.Handle, x, y, w, hh int32) {
+		procMoveWindow.Call(uintptr(h), uintptr(x), uintptr(y), uintptr(w), uintptr(hh), 1)
+	}
+
+	y := m
+	l1 := child("STATIC", "실행할 명령어  (예: aws sso login — 여러 명령은 && 로 연결)", wsChild|wsVisible, 0)
+	move(l1, m, y, lw, labelH)
+	y += labelH + a.scale(2)
+	c.cmdEd = child("EDIT", "", wsChild|wsVisible|wsBorder|wsTabStop|esAutoHScroll, idSetRow)
+	move(c.cmdEd, m, y, lw, eh)
+	y += eh + a.scale(10)
+
+	l2 := child("STATIC", "표시 이름 (선택 — 비우면 명령어가 그대로 표시됨)", wsChild|wsVisible, 0)
+	move(l2, m, y, lw, labelH)
+	y += labelH + a.scale(2)
+	c.nameEd = child("EDIT", "", wsChild|wsVisible|wsBorder|wsTabStop|esAutoHScroll, idSetRow)
+	move(c.nameEd, m, y, lw, eh)
+	y += eh + a.scale(14)
+
+	bw, bh := a.scale(96), a.scale(28)
+	gap := a.scale(8)
+	clientW := m*2 + lw
+	save := child("BUTTON", "추가", wsChild|wsVisible|wsTabStop|bsDefPushButton, idSetSave)
+	move(save, clientW-m-bw*2-gap, y, bw, bh)
+	cancel := child("BUTTON", "취소", wsChild|wsVisible|wsTabStop, idSetCancel)
+	move(cancel, clientW-m-bw, y, bw, bh)
+	y += bh + m
+
+	rc := rect{0, 0, clientW, y}
+	procAdjustWindowRectEx.Call(uintptr(unsafe.Pointer(&rc)), settingsStyle, 0, wsExTopmost|wsExToolWindow)
+	w, h := rc.right-rc.left, rc.bottom-rc.top
+
+	var pr rect
+	procGetWindowRect.Call(uintptr(a.hwnd), uintptr(unsafe.Pointer(&pr)))
+	x, wy := clampIntoWork(monitorWorkFromPoint(point{pr.left, pr.top}), pr.left+a.scale(24), pr.top+a.scale(24), w, h)
+	procSetWindowPos.Call(uintptr(c.hwnd), 0, uintptr(x), uintptr(wy), uintptr(w), uintptr(h), swpNoZorder)
+	procShowWindow.Call(uintptr(c.hwnd), swShow)
+	procSetForegroundWindow.Call(uintptr(c.hwnd))
+	return true
+}
+
+func (a *app) cmdAddProc(hwnd, msg, wparam, lparam uintptr) uintptr {
+	c := a.cmdAdd
+	switch msg {
+	case wmCommand:
+		if c == nil {
+			break
+		}
+		switch int(wparam & 0xFFFF) {
+		case idSetSave:
+			if c.save() {
+				procDestroyWindow.Call(hwnd)
+			}
+			return 0
+		case idSetCancel:
+			procDestroyWindow.Call(hwnd)
+			return 0
+		}
+	case wmClose:
+		procDestroyWindow.Call(hwnd)
+		return 0
+	case wmDestroy:
+		a.cmdAdd = nil
+		a.modal = false
+		if a.panelAlive {
+			a.refresh()
+			procSetForegroundWindow.Call(uintptr(a.hwnd))
+		} else {
+			procPostQuitMessage.Call(0)
+		}
+		return 0
+	}
+	r, _, _ := procDefWindowProcW.Call(hwnd, msg, wparam, lparam)
+	return r
+}
+
+// save 는 명령어를 명령어 열 폴더에 .cmd 파일로 저장한다.
+// 파일 이름 = 표시 이름, 파일 내용 = 실행할 명령어.
+func (c *cmdAddUI) save() bool {
+	a := c.a
+	cmdStr := strings.TrimSpace(getWindowText(c.cmdEd))
+	if cmdStr == "" {
+		procMessageBoxW.Call(uintptr(c.hwnd),
+			uintptr(unsafe.Pointer(utf16Ptr("실행할 명령어를 입력해 주세요."))),
+			uintptr(unsafe.Pointer(utf16Ptr("gotool"))),
+			mbOK|mbIconWarning)
+		return false
+	}
+	label := strings.TrimSpace(getWindowText(c.nameEd))
+	if label == "" {
+		label = cmdStr
+	}
+
+	dir := filepath.Join(a.dataDir, a.cols[a.cmdColIdx].Folder)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		alertErr(errFolder, "명령어 폴더를 만들 수 없습니다", err)
+		return false
+	}
+	dest := uniqueDest(dir, sanitizeFileName(label)+".cmd")
+	if err := os.WriteFile(dest, []byte(cmdStr+"\r\n"), 0o644); err != nil {
+		alertErr(errAdd, "명령어를 저장하지 못했습니다", err)
+		return false
+	}
+	return true
+}
+
+// sanitizeFileName 은 파일 이름에 쓸 수 없는 문자를 정리한다.
+func sanitizeFileName(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if strings.ContainsRune(`\/:*?"<>|`, r) || r < 0x20 {
+			return ' '
+		}
+		return r
+	}, s)
+	s = strings.Join(strings.Fields(s), " ")
+	if rs := []rune(s); len(rs) > 60 {
+		s = string(rs[:60])
+	}
+	if s == "" || s == "." || s == ".." {
+		s = "명령어"
+	}
+	return s
 }
 
 // ---- 백업/복원 ----
@@ -2988,6 +3246,30 @@ func launch(path string) {
 	op, _ := windows.UTF16PtrFromString("open")
 	p, _ := windows.UTF16PtrFromString(path)
 	procShellExecuteW.Call(0, uintptr(unsafe.Pointer(op)), uintptr(unsafe.Pointer(p)), 0, 0, swShowNormal)
+}
+
+// launchItem 은 항목을 연다. 배치 스크립트(.cmd/.bat)는 cmd /k 로 실행해서
+// 명령이 끝나도 cmd 창이 닫히지 않고 그대로 남는다.
+func (a *app) launchItem(path string) {
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext == ".cmd" || ext == ".bat" {
+		op, _ := windows.UTF16PtrFromString("open")
+		exe, _ := windows.UTF16PtrFromString("cmd.exe")
+		args, _ := windows.UTF16PtrFromString(`/k "` + path + `"`)
+		home, _ := os.UserHomeDir()
+		var dirPtr *uint16
+		if home != "" {
+			dirPtr, _ = windows.UTF16PtrFromString(home)
+		}
+		procShellExecuteW.Call(0,
+			uintptr(unsafe.Pointer(op)),
+			uintptr(unsafe.Pointer(exe)),
+			uintptr(unsafe.Pointer(args)),
+			uintptr(unsafe.Pointer(dirPtr)),
+			swShowNormal)
+		return
+	}
+	launch(path)
 }
 
 func launchWith(exe, arg string) {
