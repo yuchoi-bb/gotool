@@ -287,8 +287,11 @@ const (
 	nifTip     = 0x4
 
 	mfString    = 0x0000
+	mfGrayed    = 0x0001
 	mfChecked   = 0x0008
 	mfSeparator = 0x0800
+
+	dtFlagsRight = 0x0002 | 0x0020 | 0x0004 | 0x0800 // DT_RIGHT|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX
 
 	tpmReturnCmd = 0x0100
 )
@@ -702,6 +705,8 @@ type app struct {
 	cmdAdd    *cmdAddUI // 열려 있는 명령어 추가 창(없으면 nil)
 	cmdClsReg bool
 
+	verRc rect // 우측 하단 버전 표시
+
 	// 상주(트레이) 모드
 	trayAdded bool
 	hook      uintptr // 더블 ESC 감지용 저수준 키보드 훅
@@ -946,8 +951,8 @@ func (a *app) addTray() {
 		uCallbackMessage: wmAppTray,
 		hIcon:            windows.Handle(icon),
 	}
-	tip, _ := windows.UTF16FromString("gotool — ESC 두 번 또는 클릭")
-	copy(nid.szTip[:], tip)
+	tip, _ := windows.UTF16FromString("gotool " + version + " — ESC 두 번 또는 클릭")
+	copy(nid.szTip[:min(len(tip), len(nid.szTip)-1)], tip)
 	if r, _, _ := procShellNotifyIconW.Call(nimAdd, uintptr(unsafe.Pointer(&nid))); r != 0 {
 		a.trayAdded = true
 	}
@@ -999,6 +1004,8 @@ func (a *app) trayMenu() {
 	appendItem := func(id uintptr, flags uintptr, text string) {
 		procAppendMenuW.Call(hMenu, flags, id, uintptr(unsafe.Pointer(utf16Ptr(text))))
 	}
+	appendItem(0, mfString|mfGrayed, "gotool "+version)
+	procAppendMenuW.Call(hMenu, mfSeparator, 0, 0)
 	appendItem(1, mfString, "열기")
 	autoFlags := uintptr(mfString)
 	if autoStartEnabled() {
@@ -1452,6 +1459,10 @@ func (a *app) layout() {
 		a.updRc = rect{}
 	}
 
+	// 우측 하단 버전 표시 줄
+	a.verRc = rect{pad, y, winW - pad, y + a.scale(15)}
+	y += a.scale(15)
+
 	a.winW = winW
 	a.winH = y + pad
 
@@ -1608,6 +1619,16 @@ func (a *app) paint(hdc uintptr) {
 	}
 	for _, b := range a.buttons {
 		rowText(b.rc, b.label, 0, a.hover.kind == b.kind, false, pal.hover, pal.subtle)
+	}
+
+	// 우측 하단 현재 버전
+	{
+		u, err := windows.UTF16FromString("gotool " + version)
+		if err == nil {
+			vr := a.verRc
+			procSetTextColor.Call(memDC, uintptr(pal.subtle))
+			procDrawTextW.Call(memDC, uintptr(unsafe.Pointer(&u[0])), ^uintptr(0), uintptr(unsafe.Pointer(&vr)), dtFlagsRight)
+		}
 	}
 
 	// 창 테두리
