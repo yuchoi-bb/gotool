@@ -136,9 +136,6 @@ var (
 	procAdjustWindowRectEx  = user32.NewProc("AdjustWindowRectEx")
 	procIsDialogMessageW    = user32.NewProc("IsDialogMessageW")
 	procFindWindowW         = user32.NewProc("FindWindowW")
-	procSetWindowsHookExW   = user32.NewProc("SetWindowsHookExW")
-	procUnhookWindowsHookEx = user32.NewProc("UnhookWindowsHookEx")
-	procCallNextHookEx      = user32.NewProc("CallNextHookEx")
 	procCreatePopupMenu     = user32.NewProc("CreatePopupMenu")
 	procDestroyMenu         = user32.NewProc("DestroyMenu")
 	procAppendMenuW         = user32.NewProc("AppendMenuW")
@@ -276,10 +273,6 @@ const (
 
 	swHide = 0
 
-	whKeyboardLL = 13
-	wmKeyUp      = 0x0101
-	wmSysKeyUp   = 0x0105
-
 	nimAdd     = 0
 	nimDelete  = 2
 	nifMessage = 0x1
@@ -361,10 +354,9 @@ type column struct {
 }
 
 type appConfig struct {
-	Columns          []column `json:"columns"`
-	DevKeywords      []string `json:"devKeywords,omitempty"`      // "dev" 자동 분류 키워드(비우면 기본값)
-	CmdSeeded        bool     `json:"cmdSeeded,omitempty"`        // 명령어 열 1회 자동 추가 여부
-	DisableEscHotkey bool     `json:"disableEscHotkey,omitempty"` // true면 내장 더블 ESC 단축키 끔
+	Columns     []column `json:"columns"`
+	DevKeywords []string `json:"devKeywords,omitempty"` // "dev" 자동 분류 키워드(비우면 기본값)
+	CmdSeeded   bool     `json:"cmdSeeded,omitempty"`   // 명령어 열 1회 자동 추가 여부
 }
 
 func defaultConfig() appConfig {
@@ -556,14 +548,6 @@ type notifyIconData struct {
 	hBalloonIcon     windows.Handle
 }
 
-type kbdllHookStruct struct {
-	vkCode      uint32
-	scanCode    uint32
-	flags       uint32
-	time        uint32
-	dwExtraInfo uintptr
-}
-
 // monitorWorkFromPoint 는 해당 좌표가 속한 모니터의 작업 영역을 돌려준다.
 // 창이 모니터 경계를 넘어 옆 모니터로 걸치지 않게 하는 데 쓴다.
 func monitorWorkFromPoint(pt point) rect {
@@ -709,8 +693,6 @@ type app struct {
 
 	// 상주(트레이) 모드
 	trayAdded bool
-	hook      uintptr // 더블 ESC 감지용 저수준 키보드 훅
-	lastEsc   int64   // 마지막 ESC keyup 시각(ms)
 	lastUpd   time.Time
 
 	// 아이콘 비동기 로딩/캐시: 패널을 먼저 띄우고 아이콘은 뒤에서 채운다.
@@ -857,9 +839,6 @@ func runPanel(dir string) {
 	}
 
 	a.addTray()
-	if !loadConfig(a.dataDir).DisableEscHotkey {
-		a.installEscHook() // 내장 더블 ESC 단축키(프로세스 재실행 없이 즉시 표시)
-	}
 	a.panelAlive = true
 
 	tReload := time.Now()
@@ -951,7 +930,7 @@ func (a *app) addTray() {
 		uCallbackMessage: wmAppTray,
 		hIcon:            windows.Handle(icon),
 	}
-	tip, _ := windows.UTF16FromString("gotool " + version + " — ESC 두 번 또는 클릭")
+	tip, _ := windows.UTF16FromString("gotool " + version + " — 클릭하면 열기")
 	copy(nid.szTip[:min(len(tip), len(nid.szTip)-1)], tip)
 	if r, _, _ := procShellNotifyIconW.Call(nimAdd, uintptr(unsafe.Pointer(&nid))); r != 0 {
 		a.trayAdded = true
@@ -969,31 +948,6 @@ func (a *app) removeTray() {
 	}
 	procShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&nid)))
 	a.trayAdded = false
-}
-
-// installEscHook 은 저수준 키보드 훅으로 "ESC 두 번(400ms 이내)"을 감지해 패널을 띄운다.
-func (a *app) installEscHook() {
-	cb := windows.NewCallback(func(nCode, wparam uintptr, k *kbdllHookStruct) uintptr {
-		if int32(nCode) == 0 && (wparam == wmKeyUp || wparam == wmSysKeyUp) && k != nil && k.vkCode == vkEscape {
-			now := time.Now().UnixMilli()
-			if now-a.lastEsc < 400 {
-				a.lastEsc = 0
-				procPostMessageW.Call(uintptr(a.hwnd), wmAppShow, 0, 0)
-			} else {
-				a.lastEsc = now
-			}
-		}
-		r, _, _ := procCallNextHookEx.Call(0, nCode, wparam, uintptr(unsafe.Pointer(k)))
-		return r
-	})
-	a.hook, _, _ = procSetWindowsHookExW.Call(whKeyboardLL, cb, 0, 0)
-}
-
-func (a *app) uninstallEscHook() {
-	if a.hook != 0 {
-		procUnhookWindowsHookEx.Call(a.hook)
-		a.hook = 0
-	}
 }
 
 // trayMenu 는 트레이 아이콘 우클릭 메뉴를 띄운다.
@@ -1201,7 +1155,6 @@ func (a *app) wndProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 	case wmDestroy:
 		a.panelAlive = false
 		a.removeTray()
-		a.uninstallEscHook()
 		if a.settings == nil && a.cmdAdd == nil {
 			procPostQuitMessage.Call(0)
 		}
